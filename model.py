@@ -80,13 +80,11 @@ class MUSDB18Dataset(torch.utils.data.Dataset):
         
         full_abs  = full.abs()
         vocal_abs = vocal.abs()
-
-        full_max = full_abs.max()
         
         if self.amplitude_only:
-            return full_abs / full_max, vocal_abs / full_max
+            return full_abs, vocal_abs
         else:
-            return full / full_max, vocal / full_max
+            return full, vocal
         
     def __len__(self):
         return len(self.fragments)
