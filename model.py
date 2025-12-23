@@ -149,23 +149,24 @@ class NaiveLSTM(nn.Module):
     def __init__(self, frequency_bin_count, hidden_layers):
         super(self.__class__, self).__init__()
         self.conv1d_channel_merge = nn.Conv1d(in_channels=2 * frequency_bin_count, out_channels=1 * frequency_bin_count, kernel_size=1)
+        self.relu1 = nn.ReLU()
         self.bn = nn.BatchNorm1d(frequency_bin_count)
-        self.relu = nn.ReLU()
-        self.lstm = nn.LSTM(input_size=frequency_bin_count, hidden_size=hidden_layers, batch_first=True, bidirectional=True)
+        self.lstm = nn.LSTM(input_size=frequency_bin_count, hidden_size=hidden_layers, num_layers=1, dropout=0.2, batch_first=True, bidirectional=True)
         self.last_fc = nn.Linear(hidden_layers * 2, frequency_bin_count)
+        self.relu2 = nn.ReLU()
     def forward(self, x):
         batches, channels, frequencies, timesteps = x.shape
-        x = x.view(batches, channels * frequencies, timesteps) # [batches, channels * frequencies, timesteps]
-        x = self.conv1d_channel_merge(x)                       # [batches, frequencies, timesteps] 
-        x = self.bn(x)
-        x = self.relu(x)
-        x = x.transpose(1, 2)                                  # [batches, timesteps, frequencies]
-        x, _ = self.lstm(x)                                    # [batches, timesteps, hidden_size]
-        x = self.last_fc(x)                                    # [batches, timesteps, frequencies]
-        x = x.transpose(1, 2)                                  # [batches, frequencies, timesteps]
-        x = x.unsqueeze(1)                                     # [batches, 1, frequencies, timesteps]
-        x = torch.clamp(x, 0, 1)
-        x = x.expand(-1, 2, -1, -1)                            # [batches, 2, frequencies, timesteps]
+        x = x.reshape(batches, channels * frequencies, timesteps) # [batches, channels * frequencies, timesteps]
+        x = self.conv1d_channel_merge(x)                          # [batches, frequencies, timesteps] 
+        x = self.relu1(x)
+        x = self.bn(x)                                            
+        x = x.transpose(1, 2)                                     # [batches, timesteps, frequencies]
+        x, _ = self.lstm(x)                                       # [batches, timesteps, hidden_size]
+        x = self.last_fc(x)                                       # [batches, timesteps, frequencies]
+        x = x.transpose(1, 2)                                     # [batches, frequencies, timesteps]
+        x = x.unsqueeze(1)                                        # [batches, 1, frequencies, timesteps]
+        x = self.relu2(x)
+        x = x.expand(-1, 2, -1, -1)                               # [batches, 2, frequencies, timesteps]
         return x
 
 
