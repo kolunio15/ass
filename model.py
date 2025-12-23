@@ -244,6 +244,14 @@ class NaiveConv(nn.Module):
 train_path = './train_dataset.csv'
 test_path = './test_dataset.csv'
     
+n_fft = 1024
+frequency_bin_count = n_fft // 2 + 1
+device = torch.device('cuda:0')
+model = NaiveConv(frequency_bin_count=frequency_bin_count).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=2e-4)
+batch_size = 24
+batch_limit = 10000000
+    
 match sys.argv:
     case [_, 'prepare']:
         duration = 4
@@ -276,6 +284,7 @@ match sys.argv:
             
             waveform[:, start:start+fragment.shape[1]] += fragment[:]
             weights[:, start:start+fragment.shape[1]] += 1
+            
                          
         
         waveform /= weights
@@ -303,7 +312,7 @@ match sys.argv:
                     
                 print(f'epoch {epoch:3d}/{end_epoch-1} batch: {batch:4d} train')
                 
-                break
+                if batch == batch_limit: break
             return total_loss / batch_count
         def test():
             model.eval()
@@ -320,26 +329,19 @@ match sys.argv:
                     total_loss += loss.item()
                         
                     print(f'epoch {epoch:3d}/{end_epoch-1} batch: {batch:4d} test')
-                    break
-          
+                    if batch == batch_limit: break
           
             return total_loss / batch_count
         
-        n_fft = 1024
-        frequency_bin_count = n_fft // 2 + 1
         
-        batch_size = 64
         train_dataset = torch.utils.data.DataLoader(MUSDB18Dataset(train_path, n_fft, True), batch_size=batch_size, pin_memory=True)
         test_dataset = torch.utils.data.DataLoader(MUSDB18Dataset(test_path, n_fft, True), batch_size=batch_size, pin_memory=True)            
        
-       
-        device = torch.device('cuda:0')
-        model = NaiveLSTM(frequency_bin_count=frequency_bin_count, hidden_layers=128).to(device)
         loss_fn = PerceptualLoss(sample_rate=44100, frequency_bin_count=frequency_bin_count).to(device)
-        optimizer = torch.optim.AdamW(model.parameters())
         
-        checkpoint_dir = './checkpoint'
-        log_path = './training.csv'
+        
+        checkpoint_dir = './batch_norm_checkpoint'
+        log_path = './batch_norm_training.csv'
         
         start_epoch = load_latest_checkpoint(checkpoint_dir, model, optimizer) + 1
         end_epoch = 100
@@ -349,6 +351,9 @@ match sys.argv:
         last_test_loss = 0
         
         sum_epoch_duration = 0
+        
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", patience=5, factor=0.9)
+        current_lr = scheduler.get_last_lr()
         
         with open(log_path, 'a') as log:
             for epoch in range(start_epoch, end_epoch):
@@ -367,6 +372,9 @@ match sys.argv:
                 train_delta = train_loss - last_train_loss if epoch != start_epoch else 0
                 test_delta  = test_loss - last_test_loss   if epoch != start_epoch else 0
             
+                last_train_loss = train_loss
+                last_test_loss = test_loss
+            
                 epoch_duration = test_end_time  - train_start_time
                 train_duration = train_end_time - train_start_time
                 test_duration  = test_end_time  - test_start_time
@@ -376,11 +384,76 @@ match sys.argv:
                 avg_epoch_duration = sum_epoch_duration / (epoch - start_epoch + 1)
                 remaining = (end_epoch - epoch - 1) * avg_epoch_duration
                 
-                print(f'epoch: {epoch:3d}/{end_epoch-1} train: {train_loss:.5e} test: {test_loss:.5e} Δtrain: {train_delta:.5e} Δtest: {test_loss:.5e} train duration: {train_duration / 60:2.1f}m test duration: {test_duration / 60:2.1f}m  epoch duration: {epoch_duration/60:2.1f}m elapsed: {elapsed/60/60:2.1f}h eta: {remaining/60/60:2.1f}h')
-                print(f'{epoch};{train_loss};{test_loss};{train_duration};{test_duration};{epoch_duration}', file=log)
+                print(f'epoch: {epoch:3d}/{end_epoch-1} train: {train_loss:.5e} test: {test_loss:.5e} Δtrain: {train_delta:.5e} Δtest: {test_delta:.5e} train duration: {train_duration / 60:2.1f}m test duration: {test_duration / 60:2.1f}m  epoch duration: {epoch_duration/60:2.1f}m elapsed: {elapsed/60/60:2.1f}h eta: {remaining/60/60:2.1f}h')
+                print(f'{epoch};{train_loss};{test_loss};{train_duration};{test_duration};{epoch_duration};{current_lr[0]}', file=log)
                 log.flush()
+                
+                scheduler.step(test_loss)
+                if scheduler.get_last_lr() != current_lr:
+                    print(f'lowered learning rate from {current_lr} to {scheduler.get_last_lr()}')
+                    current_lr = scheduler.get_last_lr()
+                
+                
+                
     case [_, 'infer', checkpoint, input_path, output_path]:
+        model.eval()
+        with torch.no_grad():
+            duration = 4
+            overlap  = 2
+            
+            frames = int(duration * 44100)
+            hop    = int((duration - overlap) * 44100)
         
+            info = torchaudio.info(input_path)
+            assert info.sample_rate == 44100
+            
+            
+            load_checkpoint(checkpoint, model, optimizer)
+            
+            vocal_waveform = torch.zeros((2, info.num_frames), dtype=torch.float32)
+            instr_waveform = torch.zeros((2, info.num_frames), dtype=torch.float32)
+            weights = torch.zeros((1, info.num_frames),  dtype=torch.float32)
+            
+            window = torch.hann_window(n_fft, periodic=True, dtype=torch.float32)
+            
+            for start in range(0, info.num_frames - frames, hop):
+                end = start + frames
+                
+                print(f'{start:10d}/{info.num_frames}')
+                
+                samples, _ = torchaudio.load(
+                    input_path,
+                    frame_offset = start, 
+                    num_frames = end - start, 
+                    normalize = True, 
+                    channels_first = True
+                )
+                
+                full = torch.stft(samples, n_fft=n_fft, return_complex=True, window=window)
+                full_abs = full.abs()
+                
+                phase = full / torch.clamp(full_abs, min=1e-24)
+                
+
+                x = full_abs.unsqueeze(0).to(device)
+                y = model(x)[0].cpu()
+           
+                vocal = phase * y
+                instr = phase * torch.clamp(full_abs - y, min=0)
+                
+                vocal_reconstructed = torch.istft(vocal, n_fft=n_fft, window=window, center=True)
+                instr_reconstructed = torch.istft(instr, n_fft=n_fft, window=window, center=True)
+                
+                vocal_waveform[:, start:start+vocal_reconstructed.shape[1]] += vocal_reconstructed[:]
+                instr_waveform[:, start:start+vocal_reconstructed.shape[1]] += instr_reconstructed[:]
+                weights       [:, start:start+vocal_reconstructed.shape[1]] += 1
+                             
+            vocal_waveform /= weights
+            instr_waveform /= weights
+            path_obj = Path(output_path)
+            torchaudio.save(path_obj.stem + '_vocal' + path_obj.suffix, vocal_waveform, 44100)
+            torchaudio.save(path_obj.stem + '_instr' + path_obj.suffix, instr_waveform, 44100)
+            print('complete')
     case _:
         print(f'unknown command')
         print(f'usage:')
