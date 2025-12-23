@@ -168,6 +168,76 @@ class NaiveLSTM(nn.Module):
         x = self.relu2(x)
         x = x.expand(-1, 2, -1, -1)                               # [batches, 2, frequencies, timesteps]
         return x
+        
+class NaiveConv(nn.Module):
+    def __init__(self, frequency_bin_count): 
+        super(self.__class__, self).__init__()
+        self.conv2d_1 = nn.Conv2d(in_channels=2, out_channels=12, kernel_size=3, padding=1) 
+        self.bn1 = nn.BatchNorm2d(12)
+        self.max_pool2d_1 = nn.MaxPool2d(kernel_size=(3, 3), stride=(3, 3))             
+        
+        
+        self.conv2d_2 = nn.Conv2d(in_channels=12, out_channels=20, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(20)
+        self.max_pool2d_2 = nn.MaxPool2d(kernel_size=(1, 3), stride=(1, 3))                 
+        
+        self.conv2d_3 = nn.Conv2d(in_channels=20, out_channels=40, kernel_size=3, padding=1)                          
+        self.bn3 = nn.BatchNorm2d(40)
+        self.conv2d_4 = nn.Conv2d(in_channels=40, out_channels=30, kernel_size=3, padding=1)
+        self.bn4 = nn.BatchNorm2d(30)
+        self.conv2d_5 = nn.Conv2d(in_channels=30, out_channels=20, kernel_size=3, padding=1)
+        self.bn5 = nn.BatchNorm2d(20)
+
+        self.conv2d_6 = nn.Conv2d(in_channels=20, out_channels=12, kernel_size=3, padding=1)
+        self.bn6 = nn.BatchNorm2d(12)
+        
+        self.conv2d_7 = nn.Conv2d(in_channels=12, out_channels=2, kernel_size=3,  padding=1)
+        
+    def forward(self, x):
+        batches, channels, frequencies, timesteps = x.shape
+        
+        
+        x = x.transpose(2, 3)                                                # [batches, 2, timesteps, frequencies]
+        saved_2_channel = x
+        
+        x = self.conv2d_1(x)                                                 # [batches, 12, timesteps, frequency_bin_count]
+        x = self.bn1(x)
+        saved_12_channel = x
+        x = nn.functional.relu(x)
+        x = self.max_pool2d_1(x)                                             # [batches, 12, timesteps/3, frequency_bin_count/3]
+        
+        x = self.conv2d_2(x)                                                 # [batches, 20, timesteps/3, frequency_bin_count/9]
+        x = self.bn2(x)
+        saved_20_channel = x
+        x = nn.functional.relu(x)
+        x = self.max_pool2d_2(x)                                             # [batches, 20, timesteps/3, frequency_bin_count/9]
+        
+        x = self.conv2d_3(x)                                                 # [batches, 40, timesteps/3, frequency_bin_count/9]
+        x = self.bn3(x)
+        x = nn.functional.relu(x)
+        x = self.conv2d_4(x)                                                 # [batches, 30, timesteps/3, frequency_bin_count/9]
+        x = self.bn4(x)
+        x = nn.functional.relu(x)
+        
+        x = self.conv2d_5(x)                                                 # [batches, 20, timesteps/3, frequency_bin_count/9]
+        x = self.bn5(x)
+        x = nn.functional.relu(x)
+        x = nn.functional.interpolate(x, scale_factor=(1, 3), mode='nearest')# [batches, 20, timesteps/3, frequency_bin_count/3]
+        x = x * torch.sigmoid(saved_20_channel)
+        
+        x = self.conv2d_6(x)                                                 # [batches, 12, timesteps/3, frequency_bin_count/3]
+        x = self.bn6(x)
+        x = nn.functional.relu(x)
+        x = nn.functional.interpolate(x, scale_factor=(3, 3), mode='nearest')# [batches, 12, timesteps,   frequency_bin_count]
+        x = x * torch.sigmoid(saved_12_channel)
+
+        x = self.conv2d_7(x)                                                 # [batches  2,  timesteps,   frequency_bin_count]
+        x = nn.functional.relu(x)
+        x = x * torch.sigmoid(saved_2_channel)
+        x = x.transpose(2, 3)                                                # [batches, 2, frequencies, timesteps]
+        
+        return x
+        
 
 
     
