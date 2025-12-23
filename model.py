@@ -132,12 +132,18 @@ class PerceptualLoss(nn.Module):
         clamped_frequencies = np.minimum(np.maximum(frequencies, freqs[0]), freqs[-1])
 
         spl = torch.from_numpy(cs(np.log10(clamped_frequencies))).unsqueeze(1)
-
-        self.register_buffer('spl', spl, persistent=False)
+        spl_min = spl.min()
+        spl_max = spl.max()
+        frequency_loudness = 1 - (spl - spl_min) / (spl_max - spl_min)
+        
+        
+        self.register_buffer('frequency_loudness', frequency_loudness, persistent=False)
 
     def forward(self, y_predicted, y_correct):
-        loss = (torch.log1p(y_predicted) - torch.log1p(y_correct)).abs()
-        return (loss * self.spl).mean() 
+        loss = (torch.log1p(y_predicted) - torch.log1p(y_correct)).abs()        
+        loss = (loss * self.frequency_loudness).mean()         
+        return loss
+        
 
 class NaiveLSTM(nn.Module):
     def __init__(self, frequency_bin_count, hidden_layers):
