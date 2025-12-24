@@ -1,6 +1,7 @@
 import sys
 import os
 import time
+import math
 import data
 import torch
 import torch.nn as nn
@@ -238,18 +239,154 @@ class NaiveConv(nn.Module):
         
         return x
         
+        
+class BandSplitEncoder(nn.Module):
+    def __init__(self, frequency_bins, features): 
+        super(self.__class__, self).__init__()
+        self.layer_norm = nn.LayerNorm(frequency_bins)
+        self.fc = nn.Linear(in_features=frequency_bins, out_features=features)
+    def forward(self, x):
+        x = self.layer_norm(x)
+        x = self.fc(x)
+        return x
+class BandSplitDecoder(nn.Module):
+    def __init__(self, features, frequency_bins): 
+        super(self.__class__, self).__init__()
+        self.layer_norm = nn.LayerNorm(features)
+        self.fc1 = nn.Linear(in_features=features, out_features=features)
+        self.fc2 = nn.Linear(in_features=features, out_features=frequency_bins)
+    def forward(self, x):
+        x = self.layer_norm(x)
+        x = self.fc1(x)
+        x = torch.sigmoid(x)
+        x = self.fc2(x)
+        return x
+    
+        
+class BandSplitDualPath(nn.Module):
+    def __init__(self, features): 
+        super(self.__class__, self).__init__()
+        self.time_norm = nn.GroupNorm(1, features)
+        self.band_norm = nn.GroupNorm(1, features)
+        
+        self.time_lstm = nn.LSTM(input_size=features, hidden_size=features//2, bidirectional=True, batch_first=True)
+        self.band_lstm = nn.LSTM(input_size=features, hidden_size=features//2, bidirectional=True, batch_first=True) 
+        
+        self.time_fc = nn.Linear(in_features=features, out_features=features)
+        self.band_fc = nn.Linear(in_features=features, out_features=features)
+        
+    def forward(self, x):  
+        batches, bands, timesteps, features = x.shape
+        x = x.reshape(batches * bands, timesteps, features)
+        s1   = x                # [batches * bands, timesteps, features] 
+        x    = self.time_norm(x.transpose(1, 2)).transpose(1, 2)
+        x, _ = self.time_lstm(x)
+        x    = s1 + self.time_fc(x)
+        
+        x = x.reshape(batches, bands, timesteps, features)
+        x = x.transpose(1, 2).contiguous()
+        x = x.reshape(batches * timesteps, bands, features)
+        
+        s2   = x                # [batches * timesteps, bands, features] 
+        x    = self.band_norm(x.transpose(1, 2)).transpose(1, 2)
+        x, _ = self.band_lstm(x)
+        x    = s2 + self.band_fc(x)
+        
+        x = x.reshape(batches, timesteps, bands, features)
+        x = x.transpose(1, 2)
+        
+        return x
+        
+        
+class BandSplitRNN(nn.Module):
+    def __init__(self, frequency_bin_count, dual_path_count, features=64): 
+        super(self.__class__, self).__init__()    
+       
+        bin_diff = (44100 / 2) / frequency_bin_count
+        recommended_bands_frequencies = [(2, 150), (8, 500), (16, 2000), (18, 6000), (6, 12000), (6, 22050)]
+        
+        self.band_split_ranges = []
+        start = 0
+        for bands, split_freq in recommended_bands_frequencies:
+            end = math.floor(split_freq / bin_diff)
+            
+            bins = end - start
+            bands = min(bands, bins)
+            
+            base_width = bins // bands
+            remainder = bins % bands
+            
+            s = start
+            for i in range(bands):
+                width = base_width + (1 if i < remainder else 0)
+                e = s + width
+                
+                # print(f'{s}, {e}, {s * bin_diff:5.0f}, {e * bin_diff:5.0f}, diff: {e - s}')
+                self.band_split_ranges.append((s, e))
+                s = e
+            start = end
+        last_s, _ = self.band_split_ranges[-1]
+        self.band_split_ranges[-1] = last_s, frequency_bin_count
+        
+        self.conv1d_channel_merge = nn.Conv1d(in_channels=2 * frequency_bin_count, out_channels=1 * frequency_bin_count, kernel_size=1)
+        
+        self.encoders = nn.ModuleList()
+        self.decoders = nn.ModuleList()        
+        for start, end in self.band_split_ranges:
+            self.encoders.append(
+                BandSplitEncoder(frequency_bins=end-start, features=features)
+            )
+            self.decoders.append(
+                BandSplitDecoder(features=features, frequency_bins=end-start)
+            )
+        
+        self.dual_path = nn.Sequential(*[BandSplitDualPath(features) for _ in range(dual_path_count)])
+ 
+        
+    def forward(self, x):
+        batches, channels, frequencies, timesteps = x.shape
+        x = x.reshape(batches, channels * frequency_bin_count, timesteps) # [batches, channels * frequencies, timesteps]
+        x = self.conv1d_channel_merge(x) # [batches, frequencies, timesteps] 
+        x = x.transpose(1, 2)            # [batch, timesteps, frequencies]
+        
+        bands = []
+        for i, (start, end) in enumerate(self.band_split_ranges):
+            band = self.encoders[i](x[:, :, start:end])
+            bands.append(band)
+        
+        x = torch.stack(bands, dim=1) # [batch, bands, timesteps, frequencies]
+        
+        batches, bands, timesteps, features = x.shape
+        
+        x = self.dual_path(x)
+            
+        bands = []
+        for i, (start, end) in enumerate(self.band_split_ranges):
+            band = self.decoders[i](x[:, i])
+            bands.append(band)
+                        
+        x = torch.cat(bands, dim=2)  # [batch, timesteps, frequency_bin_count]
+        x = x.unsqueeze(1)           # [batches, 1, frequencies, timesteps]
+        x = torch.relu(x)            
+        x = x.expand(-1, 2, -1, -1)  # [batches, 2, frequencies, timesteps]
+        x = x.transpose(2, 3)        # [batches, 2, timesteps, frequencies]
+        
+        return x
+        
+        
+        
 
 
     
 train_path = './train_dataset.csv'
 test_path = './test_dataset.csv'
     
-n_fft = 1024
+n_fft = 2048
 frequency_bin_count = n_fft // 2 + 1
 device = torch.device('cuda:0')
-model = NaiveConv(frequency_bin_count=frequency_bin_count).to(device)
+model = BandSplitRNN(frequency_bin_count=frequency_bin_count, dual_path_count=12, features=64).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=2e-4)
-batch_size = 24
+batch_size = 4
 batch_limit = 10000000
     
 match sys.argv:
@@ -259,8 +396,6 @@ match sys.argv:
         prepare_musdb_index('./musdb/train/', train_path, duration, overlap)
         prepare_musdb_index('./musdb/test/',  test_path,  duration, overlap)      
     case [_, 'load_test']:
-        n_fft = 1024
-        
         waveform = torch.zeros((2, 44100 * 400), dtype=torch.float32)
         weights = torch.zeros((1, 44100 * 400),  dtype=torch.float32)
         
@@ -340,8 +475,8 @@ match sys.argv:
         loss_fn = PerceptualLoss(sample_rate=44100, frequency_bin_count=frequency_bin_count).to(device)
         
         
-        checkpoint_dir = './batch_norm_checkpoint'
-        log_path = './batch_norm_training.csv'
+        checkpoint_dir = './BSRNN_checkpoint'
+        log_path = './BSRNN_training.csv'
         
         start_epoch = load_latest_checkpoint(checkpoint_dir, model, optimizer) + 1
         end_epoch = 100
