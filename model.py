@@ -6,6 +6,7 @@ import data
 import torch
 import torch.nn as nn
 import torchaudio
+import torchinfo
 import numpy as np
 from pathlib import Path
 from scipy.interpolate import CubicSpline
@@ -394,7 +395,12 @@ match sys.argv:
         duration = 4
         overlap  = 2
         prepare_musdb_index('./musdb/train/', train_path, duration, overlap)
-        prepare_musdb_index('./musdb/test/',  test_path,  duration, overlap)      
+        prepare_musdb_index('./musdb/test/',  test_path,  duration, overlap)     
+    case [_, 'info']:
+        duration = 4 
+        sample_rate=44100        
+        timesteps = (duration * sample_rate) // (n_fft // 4) + 1
+        torchinfo.summary(model, input_size=(batch_size, 2, frequency_bin_count, timesteps))
     case [_, 'load_test']:
         waveform = torch.zeros((2, 44100 * 400), dtype=torch.float32)
         weights = torch.zeros((1, 44100 * 400),  dtype=torch.float32)
