@@ -2,14 +2,29 @@ import sys
 import os
 import time
 import math
-import data
 import torch
 import torch.nn as nn
-import torchaudio
+import soundfile
 import torchinfo
 import numpy as np
 from pathlib import Path
 from scipy.interpolate import CubicSpline
+
+def audio_info(path):
+    with soundfile.SoundFile(path) as f:
+        return f.samplerate, f.frames
+
+def audio_read(path, start, end):
+    samples, sample_rate = soundfile.read(
+        path,
+        start = start,
+        stop  = end,
+        dtype = np.float32,
+        always_2d=True
+    )
+    assert sample_rate == 44100
+    return torch.from_numpy(np.transpose(samples))
+
 
 def save_checkpoint(path, epoch, model, optimizer):
     checkpoint = {
@@ -27,15 +42,11 @@ def load_checkpoint(path, model, optimizer):
 def prepare_musdb_index(input_path, output_path, duration, overlap):
     frames = int(duration * 44100)
     hop    = int((duration - overlap) * 44100)
-    
+
     with open(output_path, 'w') as w:
         for track in os.scandir(input_path):
-            mixture_path = os.path.join(track, 'mixture.wav')
-            info = torchaudio.info(mixture_path)
-    
-            assert info.sample_rate == 44100
-         
-            for t_start in range(0, info.num_frames - frames, hop):
+            sample_rate, num_frames = audio_info(os.path.join(track, 'mixture.wav'))
+            for t_start in range(0, num_frames - frames, hop):
                 t_end = t_start + frames
                 print(f'{track.path};{t_start};{t_end}', file=w)
                 print(f'{track.path};{t_start};{t_end}')
@@ -60,23 +71,9 @@ class MUSDB18Dataset(torch.utils.data.Dataset):
         track, start, end = self.fragments[index]
         
         def get(sub_path):
-            samples, sample_rate = torchaudio.load(
-                os.path.join(track, sub_path),
-                frame_offset = start, 
-                num_frames = end - start, 
-                normalize = True, 
-                channels_first = True
-            )
-            assert sample_rate == 44100
-        
+            samples = audio_read(os.path.join(track, sub_path), start, end)
             return torch.stft(samples, n_fft=self.n_fft, return_complex=True, window=self.window)
-            
-            
-            if self.amplitude_only:
-                return spectrum_abs 
-            else:
-                return spectrum
-                
+
         full = get('./mixture.wav')
         vocal = get('./vocals.wav')
         
@@ -545,37 +542,29 @@ match sys.argv:
             frames = int(duration * 44100)
             hop    = int((duration - overlap) * 44100)
         
-            info = torchaudio.info(input_path)
-            assert info.sample_rate == 44100
-            
+            sample_rate, num_frames = audio_info(input_path)
+            assert sample_rate == 44100
             
             load_checkpoint(checkpoint, model, optimizer)
             
-            vocal_waveform = torch.zeros((2, info.num_frames), dtype=torch.float32)
-            instr_waveform = torch.zeros((2, info.num_frames), dtype=torch.float32)
-            weights = torch.zeros((1, info.num_frames),  dtype=torch.float32)
+            vocal_waveform = torch.zeros((2, num_frames), dtype=torch.float32)
+            instr_waveform = torch.zeros((2, num_frames), dtype=torch.float32)
+            weights = torch.zeros((1, num_frames),  dtype=torch.float32)
             
             window = torch.hann_window(n_fft, periodic=True, dtype=torch.float32)
             
-            for start in range(0, info.num_frames - frames, hop):
+            for start in range(0, num_frames - frames, hop):
                 end = start + frames
                 
-                print(f'{start:10d}/{info.num_frames}')
+                print(f'{start:10d}/{num_frames}')
                 
-                samples, _ = torchaudio.load(
-                    input_path,
-                    frame_offset = start, 
-                    num_frames = end - start, 
-                    normalize = True, 
-                    channels_first = True
-                )
+                samples = audio_read(input_path, start, end)
                 
                 full = torch.stft(samples, n_fft=n_fft, return_complex=True, window=window)
                 full_abs = full.abs()
                 
                 phase = full / torch.clamp(full_abs, min=1e-24)
                 
-
                 x = full_abs.unsqueeze(0).to(device)
                 y = model(x)[0].cpu()
            
@@ -592,8 +581,8 @@ match sys.argv:
             vocal_waveform /= weights
             instr_waveform /= weights
             path_obj = Path(output_path)
-            torchaudio.save(path_obj.stem + '_vocal' + path_obj.suffix, vocal_waveform, 44100)
-            torchaudio.save(path_obj.stem + '_instr' + path_obj.suffix, instr_waveform, 44100)
+            soundfile.write(path_obj.stem + '_vocal' + path_obj.suffix, vocal_waveform.transpose(), 44100)
+            soundfile.write(path_obj.stem + '_instr' + path_obj.suffix, instr_waveform.transpose(), 44100)
             print('complete')
     case _:
         print(f'unknown command')
