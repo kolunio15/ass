@@ -377,8 +377,115 @@ class BandSplitRNN(nn.Module):
         
         return x
         
-        
-        
+
+class WideConv(nn.Module):
+    def __init__(self, sample_rate, frequency_bin_count):
+        super(self.__class__, self).__init__()
+        # w = (w ​+ 2 * padding - kernel​) // stride + 1
+        # encoder
+        self.conv_ft1 = nn.Conv2d(in_channels= 2, out_channels=20, kernel_size=(5,5), stride=(1,1), padding=2)
+
+        self.conv_t1 = nn.Conv2d(in_channels=20, out_channels=40, kernel_size=(1,3), stride=(1,3),  padding=0)
+        self.conv_f1 = nn.Conv2d(in_channels=40, out_channels=60, kernel_size=(5,1), stride=(5,1),  padding=0)
+
+        self.conv_ft2 = nn.Conv2d(in_channels=60, out_channels=80, kernel_size=(5,5), stride=(1,1), padding=2)
+
+        self.conv_t2 = nn.Conv2d(in_channels=80, out_channels=100,  kernel_size=(1,5), stride=(1,5), padding=0)
+        self.conv_f2 = nn.Conv2d(in_channels=100, out_channels=120, kernel_size=(5,1), stride=(5,1), padding=0)
+
+        # bottleneck
+        self.conv_ft3 = nn.Conv2d(in_channels=120, out_channels=120, kernel_size=(5,5), stride=(1,1), padding=2)
+
+        # decoder
+        self.conv_df2 = nn.Conv2d(in_channels=120, out_channels=100, kernel_size=(5,1), stride=(1,1), padding=(2, 0))
+        self.conv_dt2 = nn.Conv2d(in_channels=100, out_channels= 80, kernel_size=(1,5), stride=(1,1), padding=(0, 2))
+
+        self.conv_dft2 = nn.Conv2d(in_channels=80, out_channels=60, kernel_size=(5,5), stride=(1,1), padding=2)
+
+        self.conv_df1 = nn.Conv2d(in_channels=60, out_channels=40, kernel_size=(5,1), stride=(1,1), padding=(2, 0))
+        self.conv_dt1 = nn.Conv2d(in_channels=40, out_channels=20, kernel_size=(1,3), stride=(1,1), padding=(0, 1))
+
+        self.conv_dft1 = nn.Conv2d(in_channels=20, out_channels=2, kernel_size=(5,5), stride=(1,1), padding=2)
+
+
+    def forward(self, x):
+        def gate(x, skip):
+            return torch.cat(x, skip, dim=1)
+
+        # [B, 2, Freq, T]
+        skip_0 = x
+
+        # encoder
+        x = self.conv_ft1(x) # [B,  20, 1025, 345]
+        skip_ft1 = x
+        x = nn.functional.gelu(x)
+
+
+        x = self.conv_t1(x)  # [B,  40, 1025, 115]
+        skip_t1 = x
+        x = nn.functional.gelu(x)
+
+
+        x = self.conv_f1(x)  # [B,  60,  205, 115]
+        skip_f1 = x
+        x = nn.functional.gelu(x)
+
+
+        x = self.conv_ft2(x) # [B,  80,  205, 115]
+        skip_ft2 = x
+        x = nn.functional.gelu(x)
+
+
+        x = self.conv_t2(x)  # [B, 100,  205, 23]
+        skip_t2 = x
+        x = nn.functional.gelu(x)
+
+        x = self.conv_f2(x)  # [B, 120,   41, 23]
+        skip_f2 = x
+        x = nn.functional.gelu(x)
+
+        # bottleneck
+        x = self.conv_ft3(x) # [B, 120,   41, 23]
+        x = nn.functional.gelu(x)
+
+        # decoder
+        x *= torch.sigmoid(skip_f2)
+        x = self.conv_df2(x) # [B, 100,   41, 23]
+        x = nn.functional.gelu(x)
+        x = nn.functional.interpolate(x, scale_factor=(5, 1), mode='nearest')  # [B, 100,  205, 23]
+
+        x = gate(x, skip_t2)
+        x = self.conv_dt2(x) # [B,  80,   41, 23]
+        x = nn.functional.gelu(x)
+        x = nn.functional.interpolate(x, scale_factor=(1, 5), mode='nearest') #  [B,  80,  205, 115]
+
+
+        x = gate(x, skip_ft2)
+        x = self.conv_dft2(x)     #  [B,  60,  205, 115]
+        x = nn.functional.gelu(x)
+
+
+        x = gate(x, skip_f1)
+        x = self.conv_df1(x) # [B,  40,  205, 115]
+        x = nn.functional.gelu(x)
+        x = nn.functional.interpolate(x, scale_factor=(5, 1), mode='nearest') #  [B,  40, 1025, 115]
+
+        x = gate(x, skip_t1)
+        x = self.conv_dt1(x) # [B,  20, 1025, 115]
+        x = nn.functional.gelu(x)
+        x = nn.functional.interpolate(x, scale_factor=(1, 3), mode='nearest') #  [B,  20, 1025, 345]
+
+
+        x = gate(x, skip_ft1)
+        x = self.conv_dft1(x) # [B, 2, 1025, 345]
+        x = nn.functional.gelu(x)
+
+        x = gate(x, skip_0)
+        x = torch.relu(x)
+
+        return x
+
+
 
 
     
