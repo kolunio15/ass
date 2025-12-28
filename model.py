@@ -685,7 +685,7 @@ match sys.argv:
         
         sum_epoch_duration = 0
         
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", patience=5, factor=0.9)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", patience=2, factor=0.95)
         current_lr = scheduler.get_last_lr()
         
         with open(log_path, 'a') as log:
@@ -695,7 +695,7 @@ match sys.argv:
                 train_end_time = time.perf_counter()
                 
                 save_checkpoint(os.path.join(checkpoint_dir, 'latest.zip'), epoch, model, optimizer)
-                if epoch != 0 and epoch % 10 == 0:
+                if epoch != 0 and epoch % 1 == 0:
                     save_checkpoint(os.path.join(checkpoint_dir, f'{epoch}.zip'), epoch, model, optimizer)
                 
                 test_start_time = time.perf_counter()
@@ -747,15 +747,18 @@ match sys.argv:
             weights = torch.zeros((1, num_frames),  dtype=torch.float32)
             
             window = torch.hann_window(n_fft, periodic=True, dtype=torch.float32)
-            
+
+            full_samples = audio_read(input_path, 0, num_frames)
+            rms = full_samples.square().mean().sqrt()
+
+            full_samples_normalised = full_samples / rms
+
             for start in range(0, num_frames - frames, hop):
                 end = start + frames
                 
                 print(f'{start:10d}/{num_frames}')
                 
-                samples = audio_read(input_path, start, end)
-                
-                full = torch.stft(samples, n_fft=n_fft, return_complex=True, window=window)
+                full = torch.stft(full_samples_normalised[:, start:end], n_fft=n_fft, return_complex=True, window=window)
                 full_abs = full.abs()
                 
                 phase = full / torch.clamp(full_abs, min=1e-24)
@@ -763,11 +766,11 @@ match sys.argv:
                 x = full_abs.unsqueeze(0).to(device)
                 y = model(x)[0].cpu()
            
-                vocal = phase * y
+                vocal = phase * torch.clamp(y, min=0)
                 instr = phase * torch.clamp(full_abs - y, min=0)
                 
-                vocal_reconstructed = torch.istft(vocal, n_fft=n_fft, window=window, center=True)
-                instr_reconstructed = torch.istft(instr, n_fft=n_fft, window=window, center=True)
+                vocal_reconstructed = torch.istft(vocal, n_fft=n_fft, window=window, center=True) * rms
+                instr_reconstructed = torch.istft(instr, n_fft=n_fft, window=window, center=True) * rms
                 
                 vocal_waveform[:, start:start+vocal_reconstructed.shape[1]] += vocal_reconstructed[:]
                 instr_waveform[:, start:start+vocal_reconstructed.shape[1]] += instr_reconstructed[:]
@@ -775,9 +778,11 @@ match sys.argv:
                              
             vocal_waveform /= weights
             instr_waveform /= weights
+
+
             path_obj = Path(output_path)
-            soundfile.write(path_obj.stem + '_vocal' + path_obj.suffix, vocal_waveform.transpose(), 44100)
-            soundfile.write(path_obj.stem + '_instr' + path_obj.suffix, instr_waveform.transpose(), 44100)
+            soundfile.write(os.path.join(path_obj.parent, path_obj.stem+ '_vocal' + path_obj.suffix), vocal_waveform.t(), 44100)
+            soundfile.write(os.path.join(path_obj.parent, path_obj.stem+ '_instr' + path_obj.suffix), instr_waveform.t(), 44100)
             print('complete')
     case _:
         print(f'unknown command')
