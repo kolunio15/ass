@@ -45,11 +45,16 @@ def prepare_musdb_index(input_path, output_path, duration, overlap):
 
     with open(output_path, 'w') as w:
         for track in os.scandir(input_path):
-            sample_rate, num_frames = audio_info(os.path.join(track, 'mixture.wav'))
+            path = os.path.join(track, 'mixture.wav')
+            sample_rate, num_frames = audio_info(path)
+
+            rms = audio_read(path, 0, num_frames).square().mean().sqrt()
+
             for t_start in range(0, num_frames - frames, hop):
                 t_end = t_start + frames
-                print(f'{track.path};{t_start};{t_end}', file=w)
-                print(f'{track.path};{t_start};{t_end}')
+
+                print(f'{track.path};{t_start};{t_end};{rms}', file=w)
+                print(f'{track.path};{t_start};{t_end};{rms}')
 
 class MUSDB18Dataset(torch.utils.data.Dataset):
     def __init__(self, dataset_index_path, n_fft, amplitude_only):
@@ -58,8 +63,8 @@ class MUSDB18Dataset(torch.utils.data.Dataset):
             lines = r.readlines()
             
         def line_to_fragment(line):
-            [track, start, end] = line.split(';')
-            return track, int(start), int(end)
+            [track, start, end, rms] = line.split(';')
+            return track, int(start), int(end), float(rms)
         
         self.fragments = list(map(line_to_fragment, lines))
         self.n_fft = n_fft
@@ -68,10 +73,11 @@ class MUSDB18Dataset(torch.utils.data.Dataset):
         
     
     def __getitem__(self, index):
-        track, start, end = self.fragments[index]
+        track, start, end, rms = self.fragments[index]
         
         def get(sub_path):
             samples = audio_read(os.path.join(track, sub_path), start, end)
+            samples /= rms
             return torch.stft(samples, n_fft=self.n_fft, return_complex=True, window=self.window)
 
         full = get('./mixture.wav')
