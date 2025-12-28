@@ -505,20 +505,19 @@ class BetterConv(nn.Module):
         self.conv2d_5 = nn.Conv2d(in_channels=30, out_channels=20, kernel_size=5, padding=2)
         self.bn5 = nn.BatchNorm2d(20)
 
-        self.conv2d_6 = nn.Conv2d(in_channels=20*2, out_channels=12, kernel_size=5, padding=2)
+        self.conv2d_6 = nn.Conv2d(in_channels=20, out_channels=12, kernel_size=5, padding=2)
         self.bn6 = nn.BatchNorm2d(12)
 
-        self.conv2d_7 = nn.Conv2d(in_channels=12*2, out_channels=2, kernel_size=5,  padding=2)
+        self.conv2d_7 = nn.Conv2d(in_channels=12, out_channels=2, kernel_size=5,  padding=2)
 
         self.lstm = nn.LSTM(input_size=frequency_bin_count//25, hidden_size=64, batch_first=True, bidirectional=True)
         self.fc = nn.Linear(128, frequency_bin_count//25)
 
     def forward(self, x):
         def gate(x, skip):
-            return torch.cat((x, skip), dim=1)
+            return x * torch.tanh(skip)
 
         batches, channels, frequencies, timesteps = x.shape
-
 
         x = x.transpose(2, 3)                                                # [batches, 2, timesteps, frequencies]
         saved_2_channel = x
@@ -549,7 +548,6 @@ class BetterConv(nn.Module):
         x = self.fc(x)
         x = x.reshape(batches, channels, steps, freqs)
 
-
         x = self.conv2d_5(x)                                                 # [batches, 20, timesteps/3, frequency_bin_count/9]
         x = self.bn5(x)
         x = nn.functional.gelu(x)
@@ -564,7 +562,7 @@ class BetterConv(nn.Module):
 
         x = self.conv2d_7(x)                                                 # [batches  2,  timesteps,   frequency_bin_count]
         x = nn.functional.gelu(x)
-        x = x * torch.sigmoid(saved_2_channel)
+        x = torch.tanh(x) * saved_2_channel  # masking
         x = x.transpose(2, 3)                                                # [batches, 2, frequencies, timesteps]
 
         return x
@@ -582,6 +580,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=2e-4)
 batch_size = 4
 batch_limit = 10000000
     
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 match sys.argv:
     case [_, 'prepare']:
         duration = 4
@@ -673,8 +672,8 @@ match sys.argv:
         loss_fn = PerceptualLoss(sample_rate=44100, frequency_bin_count=frequency_bin_count).to(device)
         
         
-        checkpoint_dir = './BSRNN_checkpoint'
-        log_path = './BSRNN_training.csv'
+        checkpoint_dir = './BetterConv_checkpoint'
+        log_path = './BetterConv_training.csv'
         
         start_epoch = load_latest_checkpoint(checkpoint_dir, model, optimizer) + 1
         end_epoch = 100
@@ -685,7 +684,7 @@ match sys.argv:
         
         sum_epoch_duration = 0
         
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", patience=2, factor=0.95)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", patience=2, factor=0.8)
         current_lr = scheduler.get_last_lr()
         
         with open(log_path, 'a') as log:
