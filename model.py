@@ -128,7 +128,7 @@ class PerceptualLoss(nn.Module):
         spl = torch.from_numpy(cs(np.log10(clamped_frequencies))).unsqueeze(1)
         spl_min = spl.min()
         spl_max = spl.max()
-        frequency_loudness = 1 - (spl - spl_min) / (spl_max - spl_min)
+        frequency_loudness = torch.clamp(1 - (spl - spl_min) / (spl_max - spl_min), min=0.1)
         
         
         self.register_buffer('frequency_loudness', frequency_loudness, persistent=False)
