@@ -745,12 +745,15 @@ match sys.argv:
 
             full_samples_normalised = full_samples / rms
 
-            for start in range(0, num_frames - frames, hop):
+            for start in range(0, num_frames, hop):
                 end = start + frames
                 
                 print(f'{start:10d}/{num_frames}')
                 
-                full = torch.stft(full_samples_normalised[:, start:end], n_fft=n_fft, return_complex=True, window=window)
+                samples = full_samples_normalised[:, start:end]
+                samples = nn.functional.pad(samples, (0, frames - samples.shape[1]))
+
+                full = torch.stft(samples, n_fft=n_fft, return_complex=True, window=window)
                 full_abs = full.abs()
                 
                 phase = full / torch.clamp(full_abs, min=1e-24)
@@ -764,15 +767,18 @@ match sys.argv:
                 vocal_reconstructed = torch.istft(vocal, n_fft=n_fft, window=window, center=True) * rms
                 instr_reconstructed = torch.istft(instr, n_fft=n_fft, window=window, center=True) * rms
                 
-                vocal_waveform[:, start:start+vocal_reconstructed.shape[1]] += vocal_reconstructed[:]
-                instr_waveform[:, start:start+vocal_reconstructed.shape[1]] += instr_reconstructed[:]
-                weights       [:, start:start+vocal_reconstructed.shape[1]] += 1
+                size = min(vocal_reconstructed.shape[1], num_frames-start)
+
+                vocal_waveform[:, start:start+size] += vocal_reconstructed[:, 0:size]
+                instr_waveform[:, start:start+size] += instr_reconstructed[:, 0:size]
+                weights       [:, start:start+size] += 1
                              
             vocal_waveform /= weights
             instr_waveform /= weights
 
 
             path_obj = Path(output_path)
+            path_obj.parent.mkdir(parents=True, exist_ok=True)
             soundfile.write(os.path.join(path_obj.parent, path_obj.stem+ '_vocal' + path_obj.suffix), vocal_waveform.t(), 44100)
             soundfile.write(os.path.join(path_obj.parent, path_obj.stem+ '_instr' + path_obj.suffix), instr_waveform.t(), 44100)
             print('complete')
