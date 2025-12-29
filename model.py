@@ -656,8 +656,8 @@ match sys.argv:
             return total_loss / batch_count
         
         
-        train_dataset = torch.utils.data.DataLoader(MUSDB18Dataset(train_path, n_fft, True), batch_size=batch_size, pin_memory=True)
-        test_dataset = torch.utils.data.DataLoader(MUSDB18Dataset(test_path, n_fft, True), batch_size=batch_size, pin_memory=True)            
+        train_dataset = torch.utils.data.DataLoader(MUSDB18Dataset(train_path, n_fft, True), batch_size=batch_size, pin_memory=True, shuffle=True)
+        test_dataset = torch.utils.data.DataLoader(MUSDB18Dataset(test_path, n_fft, True), batch_size=batch_size, pin_memory=True)
        
         loss_fn = PerceptualLoss(sample_rate=44100, frequency_bin_count=frequency_bin_count).to(device)
         
