@@ -26,18 +26,7 @@ def audio_read(path, start, end):
     return torch.from_numpy(np.transpose(samples))
 
 
-def save_checkpoint(path, epoch, model, optimizer):
-    checkpoint = {
-        'epoch': epoch,
-        'model':    model.state_dict(),
-        'optimizer': optimizer.state_dict()
-    }
-    torch.save(checkpoint, path)
-def load_checkpoint(path, model, optimizer):
-    checkpoint = torch.load(path)
-    model.load_state_dict(checkpoint['model'])
-    optimizer.load_state_dict(checkpoint['optimizer'])
-    return checkpoint['epoch']
+
 
 def prepare_musdb_index(input_path, output_path, duration, overlap):
     frames = int(duration * 44100)
@@ -104,7 +93,7 @@ def save_checkpoint(path, epoch, model, optimizer):
     }
     torch.save(checkpoint, path)
 def load_checkpoint(path, model, optimizer):
-    checkpoint = torch.load(path)
+    checkpoint = torch.load(path, map_location=device)
     model.load_state_dict(checkpoint['model'])
     optimizer.load_state_dict(checkpoint['optimizer'])
     return checkpoint['epoch']
