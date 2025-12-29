@@ -66,7 +66,7 @@ class MUSDB18Dataset(torch.utils.data.Dataset):
         
         def get(sub_path):
             samples = audio_read(os.path.join(track, sub_path), start, end)
-            samples /= rms
+            samples /= max(rms, 1e-25)
             return torch.stft(samples, n_fft=self.n_fft, return_complex=True, window=self.window)
 
         full = get('./mixture.wav')
@@ -234,7 +234,7 @@ class NaiveConv(nn.Module):
         
         
 class BandSplitEncoder(nn.Module):
-    def __init__(self, frequency_bins, features): 
+    def __init__(self, frequency_bins, features):
         super(self.__class__, self).__init__()
         self.layer_norm = nn.LayerNorm(frequency_bins)
         self.fc = nn.Linear(in_features=frequency_bins, out_features=features)
@@ -243,15 +243,15 @@ class BandSplitEncoder(nn.Module):
         x = self.fc(x)
         return x
 class BandSplitDecoder(nn.Module):
-    def __init__(self, features, frequency_bins): 
+    def __init__(self, features, frequency_bins):
         super(self.__class__, self).__init__()
         self.layer_norm = nn.LayerNorm(features)
-        self.fc1 = nn.Linear(in_features=features, out_features=features)
-        self.fc2 = nn.Linear(in_features=features, out_features=frequency_bins)
+        self.fc1 = nn.Linear(in_features=features, out_features=features*4)
+        self.fc2 = nn.Linear(in_features=features*4, out_features=frequency_bins)
     def forward(self, x):
         x = self.layer_norm(x)
         x = self.fc1(x)
-        x = torch.sigmoid(x)
+        x = nn.functional.sigmoid(x)
         x = self.fc2(x)
         return x
     
@@ -292,11 +292,11 @@ class BandSplitDualPath(nn.Module):
         
         
 class BandSplitRNN(nn.Module):
-    def __init__(self, frequency_bin_count, dual_path_count, features=64): 
+    def __init__(self, sample_rate, frequency_bin_count, dual_path_count, features):
         super(self.__class__, self).__init__()    
        
-        bin_diff = (44100 / 2) / frequency_bin_count
-        recommended_bands_frequencies = [(2, 150), (8, 500), (16, 2000), (18, 6000), (6, 12000), (6, 22050)]
+        bin_diff = (sample_rate / 2) / frequency_bin_count
+        recommended_bands_frequencies = [(2, 150), (8, 500), (16, 2000), (16, 6000), (8, 12000), (4, 22050)]
         
         self.band_split_ranges = []
         start = 0
@@ -320,31 +320,32 @@ class BandSplitRNN(nn.Module):
             start = end
         last_s, _ = self.band_split_ranges[-1]
         self.band_split_ranges[-1] = last_s, frequency_bin_count
-        
-        self.conv1d_channel_merge = nn.Conv1d(in_channels=2 * frequency_bin_count, out_channels=1 * frequency_bin_count, kernel_size=1)
-        
+
         self.encoders = nn.ModuleList()
         self.decoders = nn.ModuleList()        
         for start, end in self.band_split_ranges:
             self.encoders.append(
-                BandSplitEncoder(frequency_bins=end-start, features=features)
+                BandSplitEncoder(frequency_bins=2*(end-start), features=features)
             )
             self.decoders.append(
-                BandSplitDecoder(features=features, frequency_bins=end-start)
+                BandSplitDecoder(features=features, frequency_bins=2*(end-start))
             )
         
         self.dual_path = nn.Sequential(*[BandSplitDualPath(features) for _ in range(dual_path_count)])
  
         
     def forward(self, x):
+        saved_input = x
+
         batches, channels, frequencies, timesteps = x.shape
-        x = x.reshape(batches, channels * frequency_bin_count, timesteps) # [batches, channels * frequencies, timesteps]
-        x = self.conv1d_channel_merge(x) # [batches, frequencies, timesteps] 
-        x = x.transpose(1, 2)            # [batch, timesteps, frequencies]
-        
+        x = x.transpose(2, 3) # [batch, channels, timesteps, frequencies]
+
         bands = []
         for i, (start, end) in enumerate(self.band_split_ranges):
-            band = self.encoders[i](x[:, :, start:end])
+            band = x[:, :, :, start:end]
+            band = band.permute(0, 2, 1, 3) # [batch, timesteps, channels, frequencies]
+            band = band.reshape(batches, timesteps, channels * (end-start)) # [batch, timesteps, channels * frequencies]
+            band = self.encoders[i](band)
             bands.append(band)
         
         x = torch.stack(bands, dim=1) # [batch, bands, timesteps, frequencies]
@@ -356,14 +357,15 @@ class BandSplitRNN(nn.Module):
         bands = []
         for i, (start, end) in enumerate(self.band_split_ranges):
             band = self.decoders[i](x[:, i])
+            band = band.reshape(batches, timesteps, channels, end-start)
+            band = band.permute(0, 2, 3, 1)
             bands.append(band)
                         
-        x = torch.cat(bands, dim=2)  # [batch, timesteps, frequency_bin_count]
-        x = x.unsqueeze(1)           # [batches, 1, frequencies, timesteps]
-        x = torch.relu(x)            
-        x = x.expand(-1, 2, -1, -1)  # [batches, 2, frequencies, timesteps]
-        x = x.transpose(2, 3)        # [batches, 2, timesteps, frequencies]
-        
+        x = torch.cat(bands, dim=2)  # [batch, 2, frequency_bin_count, timesteps]
+
+        x = saved_input * torch.sigmoid(x)
+        x = torch.relu(x)
+
         return x
         
 
@@ -561,16 +563,16 @@ class BetterConv(nn.Module):
     
 train_path = './train_dataset.csv'
 test_path = './test_dataset.csv'
-    
+
 n_fft = 2048
 frequency_bin_count = n_fft // 2 + 1
-device = torch.device('cuda:0')
-model = BandSplitRNN(frequency_bin_count=frequency_bin_count, dual_path_count=12, features=64).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=2e-4)
-batch_size = 4
+device = torch.device('cpu') if len(sys.argv) > 1 and sys.argv[1] == 'infer' else torch.device('cuda:0')
+model = BandSplitRNN(sample_rate=44100, frequency_bin_count=frequency_bin_count, dual_path_count=8, features=64).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=1.8e-4)
+batch_size = 2
 batch_limit = 10000000
-    
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+#batch_limit = 40
+
 match sys.argv:
     case [_, 'prepare']:
         duration = 4
@@ -628,11 +630,12 @@ match sys.argv:
                 
                 loss = loss_fn(y_predicted, y_correct)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0) # gradient clipping
                 optimizer.step()
                    
                 total_loss += loss.item()
                     
-                print(f'epoch {epoch:3d}/{end_epoch-1} batch: {batch:4d} train')
+                print(f'epoch {epoch:3d}/{end_epoch-1} batch: {batch:4d} train single: {loss.item():.5e} avg: {total_loss / batch_count:.5e}')
                 
                 if batch == batch_limit: break
             return total_loss / batch_count
@@ -650,7 +653,7 @@ match sys.argv:
                     loss = loss_fn(y_predicted, y_correct)   
                     total_loss += loss.item()
                         
-                    print(f'epoch {epoch:3d}/{end_epoch-1} batch: {batch:4d} test')
+                    print(f'epoch {epoch:3d}/{end_epoch-1} batch: {batch:4d} test single: {loss.item():.5e} avg: {total_loss / batch_count:.5e}')
                     if batch == batch_limit: break
           
             return total_loss / batch_count
@@ -662,11 +665,11 @@ match sys.argv:
         loss_fn = PerceptualLoss(sample_rate=44100, frequency_bin_count=frequency_bin_count).to(device)
         
         
-        checkpoint_dir = './BetterConv_checkpoint'
-        log_path = './BetterConv_training.csv'
+        checkpoint_dir = './BandSplitRNN_checkpoint'
+        log_path = './BandSplitRNN_training.csv'
         
         start_epoch = load_latest_checkpoint(checkpoint_dir, model, optimizer) + 1
-        end_epoch = 100
+        end_epoch = 200
         
         start_time = time.perf_counter()
         last_train_loss = 0
@@ -674,7 +677,7 @@ match sys.argv:
         
         sum_epoch_duration = 0
         
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", patience=2, factor=0.8)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", patience=2, factor=0.6)
         current_lr = scheduler.get_last_lr()
         
         with open(log_path, 'a') as log:
