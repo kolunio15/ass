@@ -499,8 +499,8 @@ class BetterConv(nn.Module):
 
         self.conv2d_7 = nn.Conv2d(in_channels=12, out_channels=2, kernel_size=5,  padding=2)
 
-        self.lstm = nn.LSTM(input_size=frequency_bin_count//25, hidden_size=64, batch_first=True, bidirectional=True)
-        self.fc = nn.Linear(128, frequency_bin_count//25)
+        self.lstm = nn.LSTM(input_size=frequency_bin_count//25, hidden_size=128, batch_first=True, bidirectional=True)
+        self.fc = nn.Linear(256, frequency_bin_count//25)
 
     def forward(self, x):
         def gate(x, skip):
@@ -554,6 +554,7 @@ class BetterConv(nn.Module):
         x = torch.tanh(x) * saved_2_channel  # masking
         x = x.transpose(2, 3)                                                # [batches, 2, frequencies, timesteps]
 
+        x = torch.relu(x)
         return x
 
 
