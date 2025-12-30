@@ -189,7 +189,7 @@ class NaiveLSTM(nn.Module):
         return x
         
 class NaiveConv(nn.Module):
-    def __init__(self, frequency_bin_count): 
+    def __init__(self, sample_rate, frequency_bin_count):
         super(self.__class__, self).__init__()
         self.conv2d_1 = nn.Conv2d(in_channels=2, out_channels=12, kernel_size=3, padding=1) 
         self.bn1 = nn.BatchNorm2d(12)
@@ -222,39 +222,43 @@ class NaiveConv(nn.Module):
         x = self.conv2d_1(x)                                                 # [batches, 12, timesteps, frequency_bin_count]
         x = self.bn1(x)
         saved_12_channel = x
-        x = nn.functional.relu(x)
+        x = nn.functional.gelu(x)
         x = self.max_pool2d_1(x)                                             # [batches, 12, timesteps/3, frequency_bin_count/3]
         
         x = self.conv2d_2(x)                                                 # [batches, 20, timesteps/3, frequency_bin_count/9]
         x = self.bn2(x)
         saved_20_channel = x
-        x = nn.functional.relu(x)
+        x = nn.functional.gelu(x)
         x = self.max_pool2d_2(x)                                             # [batches, 20, timesteps/3, frequency_bin_count/9]
         
         x = self.conv2d_3(x)                                                 # [batches, 40, timesteps/3, frequency_bin_count/9]
         x = self.bn3(x)
-        x = nn.functional.relu(x)
+        x = nn.functional.gelu(x)
         x = self.conv2d_4(x)                                                 # [batches, 30, timesteps/3, frequency_bin_count/9]
         x = self.bn4(x)
-        x = nn.functional.relu(x)
+        x = nn.functional.gelu(x)
         
         x = self.conv2d_5(x)                                                 # [batches, 20, timesteps/3, frequency_bin_count/9]
         x = self.bn5(x)
-        x = nn.functional.relu(x)
+        x = nn.functional.gelu(x)
         x = nn.functional.interpolate(x, scale_factor=(1, 3), mode='nearest')# [batches, 20, timesteps/3, frequency_bin_count/3]
-        x = x * torch.sigmoid(saved_20_channel)
+        x = x * torch.tanh(saved_20_channel)
+
         
         x = self.conv2d_6(x)                                                 # [batches, 12, timesteps/3, frequency_bin_count/3]
         x = self.bn6(x)
-        x = nn.functional.relu(x)
+        x = nn.functional.gelu(x)
         x = nn.functional.interpolate(x, scale_factor=(3, 3), mode='nearest')# [batches, 12, timesteps,   frequency_bin_count]
-        x = x * torch.sigmoid(saved_12_channel)
+        x = x * torch.tanh(saved_12_channel)
 
         x = self.conv2d_7(x)                                                 # [batches  2,  timesteps,   frequency_bin_count]
         x = nn.functional.relu(x)
-        x = x * torch.sigmoid(saved_2_channel)
+
+        x = torch.tanh(x) * saved_2_channel
         x = x.transpose(2, 3)                                                # [batches, 2, frequencies, timesteps]
-        
+
+        x = torch.relu(x)
+
         return x
         
         
