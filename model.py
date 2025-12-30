@@ -27,6 +27,10 @@ def audio_read(path, start, end):
 
 
 
+def is_chunk_silent(chunk):
+    rms = chunk.square().mean().sqrt()
+    return rms < 1e-3
+
 
 def prepare_musdb_index(input_path, output_path, duration, overlap):
     frames = int(duration * 44100)
@@ -34,55 +38,76 @@ def prepare_musdb_index(input_path, output_path, duration, overlap):
 
     with open(output_path, 'w') as w:
         for track in os.scandir(input_path):
-            path = os.path.join(track, 'mixture.wav')
-            sample_rate, num_frames = audio_info(path)
+            bass_path    = os.path.join(track, 'bass.wav')
+            drums_path   = os.path.join(track, 'drums.wav')
+            other_path   = os.path.join(track, 'other.wav')
+            vocals_path  = os.path.join(track, 'vocals.wav')
 
-            rms = audio_read(path, 0, num_frames).square().mean().sqrt()
+            sample_rate, num_frames = audio_info(bass_path)
 
             for t_start in range(0, num_frames - frames, hop):
                 t_end = t_start + frames
 
-                print(f'{track.path};{t_start};{t_end};{rms}', file=w)
-                print(f'{track.path};{t_start};{t_end};{rms}')
+                bass_silent   = is_chunk_silent(audio_read(bass_path, t_start, t_end))
+                drums_silent  = is_chunk_silent(audio_read(drums_path, t_start, t_end))
+                other_silent  = is_chunk_silent(audio_read(other_path, t_start, t_end))
+                vocals_silent = is_chunk_silent(audio_read(vocals_path, t_start, t_end))
+
+                print(f'{track.path};{t_start};{t_end};{bass_silent};{drums_silent};{other_silent};{vocals_silent}', file=w)
+                print(f'{track.path};{t_start};{t_end};{bass_silent};{drums_silent};{other_silent};{vocals_silent}')
 
 class MUSDB18Dataset(torch.utils.data.Dataset):
     def __init__(self, dataset_index_path, n_fft, amplitude_only):
         lines = []
+
+        self.bass = []
+        self.drums = []
+        self.other = []
+        self.vocals = []
+
         with open(dataset_index_path, 'r') as r:
-            lines = r.readlines()
-            
-        def line_to_fragment(line):
-            [track, start, end, rms] = line.split(';')
-            return track, int(start), int(end), float(rms)
-        
-        self.fragments = list(map(line_to_fragment, lines))
+            for line in r:
+                track, start, end, bass_silent, drums_silent, other_silent, vocals_silent = line.split(';')
+                start = int(start)
+                end   = int(end)
+
+                if 'False' == bass_silent.strip():   self.bass  .append((os.path.join(track, 'bass.wav'),   start, end))
+                if 'False' == drums_silent.strip():  self.drums .append((os.path.join(track, 'drums.wav'),  start, end))
+                if 'False' == other_silent.strip():  self.other .append((os.path.join(track, 'other.wav'),  start, end))
+                if 'False' == vocals_silent.strip(): self.vocals.append((os.path.join(track, 'vocals.wav'), start, end))
+
         self.n_fft = n_fft
         self.window = torch.hann_window(self.n_fft, periodic=True, dtype=torch.float32)
         self.amplitude_only = amplitude_only
         
     
     def __getitem__(self, index):
-        track, start, end, rms = self.fragments[index]
-        
-        def get(sub_path):
-            samples = audio_read(os.path.join(track, sub_path), start, end)
-            samples /= max(rms, 1e-25)
-            return torch.stft(samples, n_fft=self.n_fft, return_complex=True, window=self.window)
+        bass   = audio_read(*self.bass  [torch.randint(high=len(self.bass),   size=(1,))]) * (torch.rand(1) * 1.25)
+        drums  = audio_read(*self.drums [torch.randint(high=len(self.drums),  size=(1,))]) * (torch.rand(1) * 1.25)
+        other  = audio_read(*self.other [torch.randint(high=len(self.other),  size=(1,))]) * (torch.rand(1) * 1.25)
+        vocals = audio_read(*self.vocals[torch.randint(high=len(self.vocals), size=(1,))]) * (torch.rand(1) * 1.25)
 
-        full = get('./mixture.wav')
-        vocal = get('./vocals.wav')
-        
-        full_abs  = full.abs()
-        vocal_abs = vocal.abs()
-        
+        mix = bass + drums + other + vocals
+
+        if mix.abs().max() > 1.0:
+            maximum = mix.abs().max()
+            mix    /= maximum
+            # bass   /= maximum
+            # drums  /= maximum
+            # other  /= maximum
+            vocals /= maximum
+
+        mix    = torch.stft(mix,    n_fft=self.n_fft, return_complex=True, window=self.window)
+        vocals = torch.stft(vocals, n_fft=self.n_fft, return_complex=True, window=self.window)
+
         if self.amplitude_only:
-            return full_abs, vocal_abs
+            return mix.abs(), vocals.abs()
         else:
-            return full, vocal
+            return mix, vocals
         
     def __len__(self):
-        return len(self.fragments)
-    
+        return max(len(self.bass), len(self.drums), len(self.other), len(self.vocals))
+
 def save_checkpoint(path, epoch, model, optimizer):
     Path(path).parent.mkdir(exist_ok=True, parents=True)
     
@@ -741,16 +766,14 @@ match sys.argv:
             window = torch.hann_window(n_fft, periodic=True, dtype=torch.float32)
 
             full_samples = audio_read(input_path, 0, num_frames)
-            rms = full_samples.square().mean().sqrt()
 
-            full_samples_normalised = full_samples / rms
 
             for start in range(0, num_frames, hop):
                 end = start + frames
                 
                 print(f'{start:10d}/{num_frames}')
                 
-                samples = full_samples_normalised[:, start:end]
+                samples = full_samples[:, start:end]
                 samples = nn.functional.pad(samples, (0, frames - samples.shape[1]))
 
                 full = torch.stft(samples, n_fft=n_fft, return_complex=True, window=window)
@@ -764,8 +787,8 @@ match sys.argv:
                 vocal = phase * torch.clamp(y, min=0)
                 instr = phase * torch.clamp(full_abs - y, min=0)
                 
-                vocal_reconstructed = torch.istft(vocal, n_fft=n_fft, window=window, center=True) * rms
-                instr_reconstructed = torch.istft(instr, n_fft=n_fft, window=window, center=True) * rms
+                vocal_reconstructed = torch.istft(vocal, n_fft=n_fft, window=window, center=True)
+                instr_reconstructed = torch.istft(instr, n_fft=n_fft, window=window, center=True)
                 
                 size = min(vocal_reconstructed.shape[1], num_frames-start)
 
