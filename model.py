@@ -588,11 +588,235 @@ class BetterConv(nn.Module):
         return x
 
 
-    
+class TDC_Layer(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super().__init__()
+        self.norm = nn.InstanceNorm1d(num_features=in_channels, affine=True)
+        self.conv = nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, padding=kernel_size // 2)
+    def forward(self, x): # [batches * timesteps, channels, frequencies]
+        x = self.norm(x)
+        x = self.conv(x)
+        x = nn.functional.gelu(x)
+        return x
+
+class TDC(nn.Module): # Time-Distributed Convolutions (convolutions on frequencies only)
+    def __init__(self, in_channels, growth_rate, layer_count, kernel_size):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        self.projection = nn.Conv1d(in_channels=in_channels+growth_rate*layer_count, out_channels=in_channels, kernel_size=1, padding=0)
+
+        for _ in range(layer_count):
+            self.layers.append(TDC_Layer(in_channels=in_channels, out_channels=growth_rate, kernel_size=kernel_size))
+            in_channels = in_channels + growth_rate
+
+    def forward(self, x):                                         # [batches, channels, frequencies, timesteps]
+        def fwd(x):
+            batches, channels, frequencies, timesteps = x.shape
+            x = x.permute(0, 3, 1, 2)                                 # [batches, timesteps, channels, frequencies]
+            x = x.reshape(batches * timesteps, channels, frequencies) # [batches * timesteps, channels, frequencies]
+            for layer in self.layers:
+                x = torch.cat((x, layer(x)), dim=1)
+            x = self.projection(x)
+            x = x.reshape(batches, timesteps, channels, frequencies)
+            x = x.permute(0, 2, 3, 1)                                 # [batches, channels, frequencies, timesteps]
+
+            return x
+
+        return torch.utils.checkpoint.checkpoint(fwd, x, use_reentrant=False)
+
+class TFC_Layer(nn.Module):
+    def __init__(self, in_channels, out_channels, time_kernel_size, freq_kernel_size):
+        super().__init__()
+        self.norm = nn.InstanceNorm2d(num_features=in_channels, affine=True)
+        self.conv = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=(time_kernel_size, freq_kernel_size), padding=(time_kernel_size//2, freq_kernel_size//2))
+    def forward(self, x): # [batches, channels, frequencies, timesteps]
+        x = self.norm(x)
+        x = self.conv(x)
+        x = nn.functional.gelu(x)
+        return x
+class TFC(nn.Module): # Time-Frequency Convolutions
+    def __init__(self, in_channels, growth_rate, layer_count, time_kernel_size, freq_kernel_size):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        self.projection = nn.Conv2d(in_channels=in_channels+growth_rate*layer_count, out_channels=in_channels, kernel_size=1, padding=0)
+
+        for _ in range(layer_count):
+            self.layers.append(TFC_Layer(in_channels=in_channels, out_channels=growth_rate, time_kernel_size=time_kernel_size, freq_kernel_size=freq_kernel_size))
+            in_channels = in_channels + growth_rate
+    def forward(self, x):
+        def fwd(x):
+            for layer in self.layers:
+                x = torch.cat((x, layer(x)), dim=1)
+            x = self.projection(x)
+            return x
+
+        return torch.utils.checkpoint.checkpoint(fwd, x, use_reentrant=False)
+
+
+class TFC_TDC(nn.Module):
+    def __init__(self, in_channels, growth_rate):
+        super().__init__()
+
+        self.in_channels = in_channels
+
+        self.conv = nn.Conv2d(in_channels=in_channels, out_channels=in_channels, kernel_size=(3, 3), padding=(1, 1))
+
+        layer_count = 2
+
+        self.tfc_1 = TFC(in_channels=in_channels, growth_rate=growth_rate, layer_count=layer_count, time_kernel_size=3, freq_kernel_size=3)
+
+        self.tdc = TDC(in_channels=in_channels, growth_rate=growth_rate, layer_count=layer_count, kernel_size=3)
+
+        self.tfc_2 = TFC(in_channels=in_channels, growth_rate=growth_rate, layer_count=layer_count, time_kernel_size=3, freq_kernel_size=3)
+
+    def forward(self, x):
+        skip_0 = x
+
+        x = self.tfc_1(x)
+        skip_1 = x
+
+        x = self.tdc(x)
+        x = x + skip_1
+
+        x = self.tfc_2(x)
+        x = x + self.conv(skip_0)
+
+        return x
+
+class EncoderLayer(nn.Module):
+    def __init__(self, in_channels, growth_rate):
+        super().__init__()
+
+        self.tfc_tdc = TFC_TDC(in_channels, growth_rate)
+        self.down_sample = nn.Conv2d(in_channels=in_channels, out_channels=in_channels+growth_rate, kernel_size=(3, 3), padding=(1, 1), stride=(2, 2))
+
+    def forward(self, x):
+        x = self.tfc_tdc(x)
+        skip = x
+        x = self.down_sample(x)
+        return skip, x
+
+
+
+class Encoder(nn.Module):
+    def __init__(self, in_channels, growth_rate, encoder_layer_count):
+        super().__init__()
+        self.growth_rate = growth_rate
+        self.conv = nn.Conv1d(in_channels=in_channels, out_channels=growth_rate, kernel_size=1, padding=0)
+        self.layers = nn.ModuleList()
+
+        in_channels = growth_rate
+        for _ in range(encoder_layer_count):
+            self.layers.append(EncoderLayer(in_channels, growth_rate))
+            in_channels += growth_rate
+    def forward(self, x): # [batches, channels, frequencies, timesteps]
+        batches, channels, frequencies, timesteps = x.shape
+        x = x.permute(0, 3, 1, 2).reshape(batches * timesteps, channels, frequencies)
+        x = self.conv(x)
+        x = x.reshape(batches, timesteps, self.growth_rate, frequencies).permute(0, 2, 3, 1)
+
+        skips = []
+        for layer in self.layers:
+            skip, x = layer(x)
+            skips.append(skip)
+        return skips, x
+
+class DecoderLayer(nn.Module):
+    def __init__(self, in_channels, growth_rate):
+        super().__init__()
+        self.in_channels = in_channels
+        self.up_sample = nn.ConvTranspose2d(in_channels=in_channels, out_channels=in_channels-growth_rate, kernel_size=(3, 3), padding=(1, 1), stride=(2, 2))
+        self.tfc_tdc = TFC_TDC(in_channels-growth_rate, growth_rate)
+    def forward(self, x, skip):
+        x = self.up_sample(x, output_size=skip.shape)
+        x = self.tfc_tdc(x)
+        x *= skip
+        return x
+
+class Decoder(nn.Module):
+    def __init__(self, in_channels, out_channels, growth_rate, encoder_layer_count):
+        super().__init__()
+        self.out_channels = out_channels
+        self.conv = nn.Conv1d(in_channels=in_channels - growth_rate * encoder_layer_count, out_channels=out_channels, kernel_size=1, padding=0)
+        self.layers = nn.ModuleList()
+        for _ in range(encoder_layer_count):
+            self.layers.append(DecoderLayer(in_channels=in_channels, growth_rate=growth_rate))
+            in_channels -= growth_rate
+
+    def forward(self, skips, x):
+        for layer, skip in zip(self.layers, skips[::-1]):
+            x = layer(x, skip)
+
+
+        batches, growth_rate, frequencies, timesteps = x.shape
+        x = x.permute(0, 3, 1, 2).reshape(batches * timesteps, growth_rate, frequencies)
+        x = self.conv(x)
+        x = x.reshape(batches, timesteps, self.out_channels, frequencies).permute(0, 2, 3, 1)
+        return x
+
+
+class DenseConvDualPath(nn.Module):
+    def __init__(self, features):
+        super(self.__class__, self).__init__()
+        self.time_norm = nn.GroupNorm(1, features)
+        self.band_norm = nn.GroupNorm(1, features)
+
+        self.time_lstm = nn.LSTM(input_size=features, hidden_size=features, bidirectional=True, batch_first=True)
+        self.band_lstm = nn.LSTM(input_size=features, hidden_size=features, bidirectional=True, batch_first=True)
+
+        self.time_fc = nn.Linear(in_features=features*2, out_features=features)
+        self.band_fc = nn.Linear(in_features=features*2, out_features=features)
+
+    def forward(self, x):
+        batches, channels, features, timesteps = x.shape
+        x = x.transpose(2, 3)
+        x = x.reshape(batches * channels, timesteps, features)
+        s1   = x                # [batches * channels, timesteps, features]
+        x    = self.time_norm(x.transpose(1, 2)).transpose(1, 2)
+        x, _ = self.time_lstm(x)
+        x    = s1 + self.time_fc(x)
+
+        x = x.reshape(batches, channels, timesteps, features)
+        x = x.transpose(1, 2).contiguous()
+        x = x.reshape(batches * timesteps, channels, features)
+
+        s2   = x                # [batches * timesteps, channels, features]
+        x    = self.band_norm(x.transpose(1, 2)).transpose(1, 2)
+        x, _ = self.band_lstm(x)
+        x    = s2 + self.band_fc(x)
+
+        x = x.reshape(batches, timesteps, channels, features)
+        x = x.permute(0, 2, 3, 1)
+
+        return x
+
+
+
+class DenseConv(nn.Module):
+    def __init__(self, growth_rate, encoder_layer_count):
+        super().__init__()
+        self.encoder = Encoder(in_channels=2, growth_rate=growth_rate, encoder_layer_count=encoder_layer_count)
+        self.decoder = Decoder(in_channels=growth_rate*(encoder_layer_count+1), out_channels=2, growth_rate=growth_rate, encoder_layer_count=encoder_layer_count)
+
+        self.bottleneck = nn.Sequential(
+            TFC_TDC(in_channels=growth_rate*(encoder_layer_count+1), growth_rate=growth_rate),
+            DenseConvDualPath(features=129)
+        )
+    def forward(self, x):
+        skips, x = self.encoder(x)
+
+        x = self.bottleneck(x)
+
+        x = self.decoder(skips, x)
+
+        x = torch.relu(x)
+        return x
+
+
 train_path = './train_dataset.csv'
 test_path = './test_dataset.csv'
 
-n_fft = 2048
+n_fft = 1024
 frequency_bin_count = n_fft // 2 + 1
 device = torch.device('cpu') if len(sys.argv) > 1 and sys.argv[1] == 'infer' else torch.device('cuda:0')
 model = BandSplitRNN(sample_rate=44100, frequency_bin_count=frequency_bin_count, dual_path_count=8, features=64).to(device)
