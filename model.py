@@ -164,15 +164,16 @@ class PerceptualLoss(nn.Module):
         
 
 class NaiveLSTM(nn.Module):
-    def __init__(self, frequency_bin_count, hidden_layers):
+    def __init__(self, sample_rate, frequency_bin_count, hidden_layers):
         super(self.__class__, self).__init__()
         self.conv1d_channel_merge = nn.Conv1d(in_channels=2 * frequency_bin_count, out_channels=1 * frequency_bin_count, kernel_size=1)
         self.relu1 = nn.ReLU()
         self.bn = nn.BatchNorm1d(frequency_bin_count)
-        self.lstm = nn.LSTM(input_size=frequency_bin_count, hidden_size=hidden_layers, num_layers=1, dropout=0.2, batch_first=True, bidirectional=True)
+        self.lstm = nn.LSTM(input_size=frequency_bin_count, hidden_size=hidden_layers, num_layers=2, dropout=0.2, batch_first=True, bidirectional=True)
         self.last_fc = nn.Linear(hidden_layers * 2, frequency_bin_count)
         self.relu2 = nn.ReLU()
     def forward(self, x):
+        saved = x
         batches, channels, frequencies, timesteps = x.shape
         x = x.reshape(batches, channels * frequencies, timesteps) # [batches, channels * frequencies, timesteps]
         x = self.conv1d_channel_merge(x)                          # [batches, frequencies, timesteps] 
@@ -185,6 +186,8 @@ class NaiveLSTM(nn.Module):
         x = x.unsqueeze(1)                                        # [batches, 1, frequencies, timesteps]
         x = self.relu2(x)
         x = x.expand(-1, 2, -1, -1)                               # [batches, 2, frequencies, timesteps]
+        x = torch.tanh(x) * saved
+
         return x
         
 class NaiveConv(nn.Module):
@@ -429,7 +432,7 @@ class WideConv(nn.Module):
 
     def forward(self, x):
         def gate(x, skip):
-            return torch.cat(x, skip, dim=1)
+            return x * torch.tanh(skip)
 
         # [B, 2, Freq, T]
         skip_0 = x
@@ -499,7 +502,7 @@ class WideConv(nn.Module):
         x = self.conv_dft1(x) # [B, 2, 1025, 345]
         x = nn.functional.gelu(x)
 
-        x = gate(x, skip_0)
+        x = torch.tanh(x) * skip_0
         x = torch.relu(x)
 
         return x
@@ -591,7 +594,7 @@ class BetterConv(nn.Module):
 class TDC_Layer(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size):
         super().__init__()
-        self.norm = nn.InstanceNorm1d(num_features=in_channels, affine=True)
+        self.norm = nn.GroupNorm(1, in_channels)
         self.conv = nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, padding=kernel_size // 2)
     def forward(self, x): # [batches * timesteps, channels, frequencies]
         x = self.norm(x)
@@ -627,7 +630,7 @@ class TDC(nn.Module): # Time-Distributed Convolutions (convolutions on frequenci
 class TFC_Layer(nn.Module):
     def __init__(self, in_channels, out_channels, time_kernel_size, freq_kernel_size):
         super().__init__()
-        self.norm = nn.InstanceNorm2d(num_features=in_channels, affine=True)
+        self.norm = nn.GroupNorm(1, in_channels)
         self.conv = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=(time_kernel_size, freq_kernel_size), padding=(time_kernel_size//2, freq_kernel_size//2))
     def forward(self, x): # [batches, channels, frequencies, timesteps]
         x = self.norm(x)
@@ -702,7 +705,7 @@ class Encoder(nn.Module):
     def __init__(self, in_channels, growth_rate, encoder_layer_count):
         super().__init__()
         self.growth_rate = growth_rate
-        self.conv = nn.Conv1d(in_channels=in_channels, out_channels=growth_rate, kernel_size=1, padding=0)
+        self.conv = nn.Conv2d(in_channels=in_channels, out_channels=growth_rate, kernel_size=1, padding=0)
         self.layers = nn.ModuleList()
 
         in_channels = growth_rate
@@ -710,11 +713,7 @@ class Encoder(nn.Module):
             self.layers.append(EncoderLayer(in_channels, growth_rate))
             in_channels += growth_rate
     def forward(self, x): # [batches, channels, frequencies, timesteps]
-        batches, channels, frequencies, timesteps = x.shape
-        x = x.permute(0, 3, 1, 2).reshape(batches * timesteps, channels, frequencies)
         x = self.conv(x)
-        x = x.reshape(batches, timesteps, self.growth_rate, frequencies).permute(0, 2, 3, 1)
-
         skips = []
         for layer in self.layers:
             skip, x = layer(x)
@@ -729,15 +728,15 @@ class DecoderLayer(nn.Module):
         self.tfc_tdc = TFC_TDC(in_channels-growth_rate, growth_rate)
     def forward(self, x, skip):
         x = self.up_sample(x, output_size=skip.shape)
-        x = self.tfc_tdc(x)
         x *= skip
+        x = self.tfc_tdc(x)
         return x
 
 class Decoder(nn.Module):
     def __init__(self, in_channels, out_channels, growth_rate, encoder_layer_count):
         super().__init__()
         self.out_channels = out_channels
-        self.conv = nn.Conv1d(in_channels=in_channels - growth_rate * encoder_layer_count, out_channels=out_channels, kernel_size=1, padding=0)
+        self.conv = nn.Conv2d(in_channels=in_channels - growth_rate * encoder_layer_count, out_channels=out_channels, kernel_size=1, padding=0)
         self.layers = nn.ModuleList()
         for _ in range(encoder_layer_count):
             self.layers.append(DecoderLayer(in_channels=in_channels, growth_rate=growth_rate))
@@ -746,12 +745,7 @@ class Decoder(nn.Module):
     def forward(self, skips, x):
         for layer, skip in zip(self.layers, skips[::-1]):
             x = layer(x, skip)
-
-
-        batches, growth_rate, frequencies, timesteps = x.shape
-        x = x.permute(0, 3, 1, 2).reshape(batches * timesteps, growth_rate, frequencies)
         x = self.conv(x)
-        x = x.reshape(batches, timesteps, self.out_channels, frequencies).permute(0, 2, 3, 1)
         return x
 
 
@@ -790,18 +784,46 @@ class DenseConvDualPath(nn.Module):
 
         return x
 
+class DenseConvBottleneck(nn.Module):
+    def __init__(self, in_channels, growth_rate, features, head_count, layer_count):
+        super(self.__class__, self).__init__()
 
+        self.head_count = head_count
+
+        self.tfc_tdc = TFC_TDC(in_channels=in_channels, growth_rate=growth_rate)
+        self.layers = nn.ModuleList()
+        for _ in range(layer_count):
+            self.layers.append(DenseConvDualPath(features=features))
+
+    def forward(self, x):
+        x = self.tfc_tdc(x)
+
+        # split
+        batches, channels, frequencies, timesteps = x.shape
+        new_channel_count = channels // self.head_count
+
+        x = x.permute(0, 2, 3, 1) # [batches, frequencies, timesteps, channels]
+        x = x.reshape(batches, frequencies, timesteps, self.head_count, new_channel_count)
+        x = x.permute(0, 3, 4, 1, 2)
+        x = x.reshape(batches * self.head_count, new_channel_count, frequencies, timesteps)
+
+        for layer in self.layers:
+            x = layer(x)
+
+        x = x.reshape(batches, self.head_count, new_channel_count, frequencies, timesteps)
+        x = x.permute(0, 3, 4, 1, 2)
+        x = x.reshape(batches, frequencies, timesteps, channels)
+        x = x.permute(0, 3, 1, 2)
+
+        return x
 
 class DenseConv(nn.Module):
-    def __init__(self, growth_rate, encoder_layer_count):
+    def __init__(self, frequency_bin_count, growth_rate, encoder_layer_count):
         super().__init__()
         self.encoder = Encoder(in_channels=2, growth_rate=growth_rate, encoder_layer_count=encoder_layer_count)
         self.decoder = Decoder(in_channels=growth_rate*(encoder_layer_count+1), out_channels=2, growth_rate=growth_rate, encoder_layer_count=encoder_layer_count)
 
-        self.bottleneck = nn.Sequential(
-            TFC_TDC(in_channels=growth_rate*(encoder_layer_count+1), growth_rate=growth_rate),
-            DenseConvDualPath(features=129)
-        )
+        self.bottleneck = DenseConvBottleneck(in_channels=growth_rate*(encoder_layer_count+1), growth_rate=growth_rate, features=math.ceil(frequency_bin_count / (2**encoder_layer_count)), head_count=2, layer_count=4)
     def forward(self, x):
         skips, x = self.encoder(x)
 
@@ -818,12 +840,14 @@ test_path = './test_dataset.csv'
 
 n_fft = 1024
 frequency_bin_count = n_fft // 2 + 1
-device = torch.device('cpu') if len(sys.argv) > 1 and sys.argv[1] == 'infer' else torch.device('cuda:0')
-model = BandSplitRNN(sample_rate=44100, frequency_bin_count=frequency_bin_count, dual_path_count=8, features=64).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=1.8e-4)
-batch_size = 2
-batch_limit = 10000000
-#batch_limit = 40
+device = torch.device('cpu') if len(sys.argv) > 1 and sys.argv[1] == 'infer' else torch.device('cuda:0')
+model = DenseConv(frequency_bin_count=frequency_bin_count, growth_rate=32, encoder_layer_count=2).to(device)
+batch_size = 1
+batch_limit = 200
+
+checkpoint_dir = './DenseConv_checkpoint/'
+log_path    = './DenseConv_training.csv'
 
 match sys.argv:
     case [_, 'prepare']:
@@ -860,7 +884,7 @@ match sys.argv:
             
             waveform[:, start:start+fragment.shape[1]] += fragment[:]
             weights[:, start:start+fragment.shape[1]] += 1
-            
+
                          
         
         waveform /= weights
@@ -917,11 +941,8 @@ match sys.argv:
         loss_fn = PerceptualLoss(sample_rate=44100, frequency_bin_count=frequency_bin_count).to(device)
         
         
-        checkpoint_dir = './BandSplitRNN_checkpoint'
-        log_path = './BandSplitRNN_training.csv'
-        
         start_epoch = load_latest_checkpoint(checkpoint_dir, model, optimizer) + 1
-        end_epoch = 200
+        end_epoch = 400
         
         start_time = time.perf_counter()
         last_train_loss = 0
@@ -929,7 +950,7 @@ match sys.argv:
         
         sum_epoch_duration = 0
         
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", patience=2, factor=0.6)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", patience=2, factor=0.8)
         current_lr = scheduler.get_last_lr()
         
         with open(log_path, 'a') as log:
@@ -1038,4 +1059,3 @@ match sys.argv:
         print(f'  prepare   | Prepares the train and test dataset indexes from ./musdb/train and ./musdb/test directories')
         print(f'  load_test | Reconstructs first track as specified in train dataset index to load_test.wav' )
         sys.exit(1)
-        
