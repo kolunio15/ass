@@ -1144,6 +1144,9 @@ match sys.argv:
     case _:
         print(f'unknown command')
         print(f'usage:')
+        print(f'  info      | Prints information about current model')
         print(f'  prepare   | Prepares the train and test dataset indexes from ./musdb/train and ./musdb/test directories')
         print(f'  load_test | Reconstructs first track as specified in train dataset index to load_test.wav' )
+        print(f'  train     | Starts or continues training using files as specified by dataset index')
+        print(f'  infer checkpoint_path input_path output_path | Infers the instrumental and vocal stems of specified track using a given checkpoint')
         sys.exit(1)
