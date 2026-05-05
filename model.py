@@ -927,7 +927,8 @@ test_path = './test_dataset.csv'
 
 n_fft = 1024
 frequency_bin_count = n_fft // 2 + 1
-device = torch.device('cuda:0')
+device = torch.device('cpu')
+if torch.cuda.is_available(): device = torch.device('cuda:0')
 model = DenseConv(frequency_bin_count=frequency_bin_count, growth_rate=32, encoder_layer_count=3).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=1.8e-4)
 #device = torch.device('cpu') if len(sys.argv) > 1 and sys.argv[1] == 'infer' else torch.device('cuda:0')
