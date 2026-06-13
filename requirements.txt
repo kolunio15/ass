@@ -2,6 +2,8 @@ matplotlib==3.10.8
 numpy==2.4.0
 scipy==1.16.3
 soundfile==0.13.1
-torch==2.9.1+cu126
-torchaudio==2.9.1+cu126
+sounddevice==0.5.5 
+torch>=2.9.1
 torchinfo==1.8.0
+tkinterdnd2==0.4.3
+librosa==0.11.0 
