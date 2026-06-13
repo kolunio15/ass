@@ -7,6 +7,7 @@ import torch.nn as nn
 import soundfile
 import torchinfo
 import numpy as np
+import shutil
 from pathlib import Path
 from scipy.interpolate import CubicSpline
 
@@ -931,7 +932,7 @@ device = torch.device('cpu')
 if torch.cuda.is_available(): device = torch.device('cuda:0')
 model = DenseConv(frequency_bin_count=frequency_bin_count, growth_rate=32, encoder_layer_count=3).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=1.8e-4)
-#device = torch.device('cpu') if len(sys.argv) > 1 and sys.argv[1] == 'infer' else torch.device('cuda:0')
+
 batch_size = 1
 batch_limit = 200
 
@@ -939,6 +940,1255 @@ checkpoint_dir = './DenseConv5_checkpoint/'
 log_path    = './DenseConv5_training.csv'
 
 match sys.argv:
+    case [_, 'gui']:
+        import tkinter as tk
+        from tkinter import ttk, filedialog, messagebox
+        import threading
+        import librosa
+        import re
+        import matplotlib.cm as cm
+
+        try:
+            from PIL import Image, ImageTk
+        except ImportError:
+            print("ERROR: Pillow (PIL) is not installed. Run: pip install pillow")
+            sys.exit(1)
+
+        try:
+            import sounddevice as sd
+
+            has_sd = True
+        except ImportError:
+            has_sd = False
+            print("Warning: sounddevice is not installed. Audio playback will be disabled.")
+
+        try:
+            from tkinterdnd2 import TkinterDnD, DND_FILES
+
+            TkClass = TkinterDnD.Tk
+            has_dnd = True
+        except ImportError:
+            TkClass = tk.Tk
+            has_dnd = False
+            print("Warning: tkinterdnd2 is not installed. Drag and Drop will be disabled.")
+
+
+        THEMES = {
+            "Cyberpunk (Default)": {
+                "BG_COLOR": "#0f0f17",
+                "PANEL_BG": "#1a1a24",
+                "TEXT_COLOR": "#c0caf5",
+                "ACCENT_CYAN": "#00ffcc",
+                "ACCENT_PINK": "#ff007f",
+                "CURSOR_COLOR": "#ffffff"
+            },
+            "Light Minimal": {
+                "BG_COLOR": "#f0f2f5",
+                "PANEL_BG": "#ffffff",
+                "TEXT_COLOR": "#2d3748",
+                "ACCENT_CYAN": "#3182ce",
+                "ACCENT_PINK": "#e53e3e",
+                "CURSOR_COLOR": "#1a202c"
+            },
+            "Solarized Light": {
+                "BG_COLOR": "#fdf6e3",
+                "PANEL_BG": "#eee8d5",
+                "TEXT_COLOR": "#657b83",
+                "ACCENT_CYAN": "#268bd2",
+                "ACCENT_PINK": "#d33682",
+                "CURSOR_COLOR": "#073642"
+            },
+            "Dracula": {
+                "BG_COLOR": "#282a36",
+                "PANEL_BG": "#44475a",
+                "TEXT_COLOR": "#f8f8f2",
+                "ACCENT_CYAN": "#8be9fd",
+                "ACCENT_PINK": "#ff79c6",
+                "CURSOR_COLOR": "#ffffff"
+            },
+            "Monokai": {
+                "BG_COLOR": "#272822",
+                "PANEL_BG": "#3e3d32",
+                "TEXT_COLOR": "#f8f8f2",
+                "ACCENT_CYAN": "#a6e22e",
+                "ACCENT_PINK": "#f92672",
+                "CURSOR_COLOR": "#ffffff"
+            },
+            "Gruvbox": {
+                "BG_COLOR": "#282828",
+                "PANEL_BG": "#3c3836",
+                "TEXT_COLOR": "#ebdbb2",
+                "ACCENT_CYAN": "#8ec07c",
+                "ACCENT_PINK": "#fb4934",
+                "CURSOR_COLOR": "#ffffff"
+            }
+        }
+
+        class AudioSeparationGUI(TkClass):
+            def __init__(self):
+                super().__init__()
+                self.title("Audio Separation - GUI")
+                self.geometry("1200x850")
+                
+                self.current_theme_name = tk.StringVar(value="Cyberpunk (Default)")
+
+                self.queue = []
+                self.is_running = False
+                self.is_paused = False
+                self.current_thread = None
+
+                self.tracks_data = {}
+                self.current_track = None
+
+                self.audio_org = np.zeros(0, dtype=np.float32)
+                self.audio_voc = np.zeros(0, dtype=np.float32)
+                self.audio_inst = np.zeros(0, dtype=np.float32)
+
+                self.full_pil_images = []
+                self.tk_images = []  
+                self.loading_spec = False
+
+                self.is_playing = False
+                self.stream = None
+                self.play_idx = 0
+                self.view_start = 0.0
+                self.cursor_time = 0.0
+
+                self.vol_org = 0.0
+                self.vol_voc = 1.0
+                self.vol_inst = 0.0
+
+                self.stft_sep_running = False
+                self.stft_sep_thread = None
+
+                self.create_widgets()
+                self.apply_theme()
+                self.bind("<space>", self.on_space_key)
+                self.bind("1", self.on_key_1)
+                self.bind("2", self.on_key_2)
+                self.bind("3", self.on_key_3)
+
+                self.scan_folder(self.out_dir_var.get())
+                self.update_playback_cursor()
+
+            def get_theme_colors(self):
+                return THEMES[self.current_theme_name.get()]
+
+            def apply_theme(self):
+                colors = self.get_theme_colors()
+                
+                self.configure(bg=colors["BG_COLOR"])
+                
+                style = ttk.Style(self)
+                style.theme_use('clam')
+
+                style.configure(".", background=colors["BG_COLOR"], foreground=colors["TEXT_COLOR"], font=('Segoe UI', 10))
+                style.configure("TFrame", background=colors["BG_COLOR"])
+                style.configure("TNotebook", background=colors["BG_COLOR"], borderwidth=0)
+                style.configure("TNotebook.Tab", background=colors["PANEL_BG"], foreground=colors["TEXT_COLOR"], padding=[15, 5])
+                style.map("TNotebook.Tab", background=[("selected", colors["ACCENT_PINK"])], foreground=[("selected", "#ffffff")])
+
+                style.configure("TLabelframe", background=colors["PANEL_BG"], foreground=colors["ACCENT_CYAN"], bordercolor=colors["ACCENT_PINK"],
+                                borderwidth=1)
+                style.configure("TLabelframe.Label", background=colors["PANEL_BG"], foreground=colors["ACCENT_CYAN"],
+                                font=('Segoe UI', 10, 'bold'))
+
+                style.configure("TButton", background=colors["PANEL_BG"], foreground=colors["ACCENT_CYAN"], bordercolor=colors["ACCENT_CYAN"],
+                                focuscolor=colors["ACCENT_PINK"], padding=5)
+                style.map("TButton", background=[("active", colors["ACCENT_CYAN"])], foreground=[("active", colors["BG_COLOR"])])
+
+                style.configure("TEntry", fieldbackground=colors["PANEL_BG"], foreground=colors["ACCENT_CYAN"], bordercolor=colors["ACCENT_CYAN"])
+                style.configure("Horizontal.TScrollbar", background=colors["PANEL_BG"], bordercolor=colors["BG_COLOR"],
+                                arrowcolor=colors["ACCENT_CYAN"], troughcolor=colors["BG_COLOR"])
+
+                style.configure("Treeview", background=colors["PANEL_BG"], fieldbackground=colors["PANEL_BG"], foreground=colors["TEXT_COLOR"],
+                                rowheight=25, borderwidth=0)
+                style.configure("Treeview.Heading", background=colors["BG_COLOR"], foreground=colors["ACCENT_PINK"],
+                                font=('Segoe UI', 10, 'bold'))
+                style.map("Treeview", background=[("selected", colors["ACCENT_PINK"])], foreground=[("selected", "#ffffff")])
+
+                self.track_listbox.config(bg=colors["PANEL_BG"], fg=colors["TEXT_COLOR"], selectbackground=colors["ACCENT_PINK"], highlightcolor=colors["ACCENT_CYAN"])
+                self.canvas.config(bg=colors["BG_COLOR"])
+                
+                self.render_plot()
+                self.update_file_status_ui()
+                
+            def on_theme_change(self, *args):
+                self.apply_theme()
+
+            def on_space_key(self, event):
+                if isinstance(event.widget, (tk.Entry, ttk.Entry)): return
+                if "button" in str(event.widget.winfo_class()).lower(): return
+                self.toggle_audio_playback()
+                
+            def on_key_1(self, event):
+                if isinstance(event.widget, (tk.Entry, ttk.Entry)): return
+                if self.notebook.index(self.notebook.select()) != 1: return # Only active on Tab 2
+                self.vol_org_var.set(1.0)
+                self.vol_voc_var.set(0.0)
+                self.vol_inst_var.set(0.0)
+                self.update_volumes()
+
+            def on_key_2(self, event):
+                if isinstance(event.widget, (tk.Entry, ttk.Entry)): return
+                if self.notebook.index(self.notebook.select()) != 1: return
+                self.vol_org_var.set(0.0)
+                self.vol_voc_var.set(1.0)
+                self.vol_inst_var.set(0.0)
+                self.update_volumes()
+
+            def on_key_3(self, event):
+                if isinstance(event.widget, (tk.Entry, ttk.Entry)): return
+                if self.notebook.index(self.notebook.select()) != 1: return
+                self.vol_org_var.set(0.0)
+                self.vol_voc_var.set(0.0)
+                self.vol_inst_var.set(1.0)
+                self.update_volumes()
+
+            def create_widgets(self):
+                top_bar = ttk.Frame(self)
+                top_bar.pack(fill=tk.X, padx=10, pady=(5, 0))
+                
+                ttk.Label(top_bar, text="Theme:").pack(side=tk.LEFT, padx=(0, 5))
+                theme_combo = ttk.Combobox(top_bar, textvariable=self.current_theme_name, values=list(THEMES.keys()), state="readonly", width=20)
+                theme_combo.pack(side=tk.LEFT)
+                theme_combo.bind("<<ComboboxSelected>>", self.on_theme_change)
+
+                self.notebook = ttk.Notebook(self)
+                self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+                # ================= Queue Tab =================
+                infer_frame = ttk.Frame(self.notebook)
+                self.notebook.add(infer_frame, text="Separation Queue")
+
+                control_frame = ttk.LabelFrame(infer_frame, text=" Settings & Controls ")
+                control_frame.pack(fill=tk.X, padx=10, pady=10)
+
+                ttk.Label(control_frame, text="Checkpoint Path:").grid(row=0, column=0, padx=10, pady=10, sticky=tk.W)
+                base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+                default_ckpt = os.path.join(base_dir, "DenseConv5_checkpoint_76a079c", "latest.zip")
+                self.ckpt_var = tk.StringVar(value=default_ckpt)
+                ttk.Entry(control_frame, textvariable=self.ckpt_var, width=70).grid(row=0, column=1, padx=10, pady=10)
+                ttk.Button(control_frame, text="Browse", command=self.browse_ckpt).grid(row=0, column=2, padx=10,
+                                                                                        pady=10)
+
+                ttk.Label(control_frame, text="Output Dir:").grid(row=1, column=0, padx=10, pady=10, sticky=tk.W)
+                self.out_dir_var = tk.StringVar(value=os.path.join(base_dir, "output"))
+                ttk.Entry(control_frame, textvariable=self.out_dir_var, width=70).grid(row=1, column=1, padx=10,
+                                                                                       pady=10)
+                ttk.Button(control_frame, text="Browse", command=self.browse_out_dir).grid(row=1, column=2, padx=10,
+                                                                                           pady=10)
+
+                time_frame = ttk.Frame(control_frame, style="TFrame")
+                time_frame.grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=10, pady=5)
+
+                ttk.Label(time_frame, text="Start Sec (0=start):").pack(side=tk.LEFT)
+                self.start_var = tk.StringVar(value="0")
+                ttk.Entry(time_frame, textvariable=self.start_var, width=10).pack(side=tk.LEFT, padx=10)
+
+                ttk.Label(time_frame, text="End Sec (0=end):").pack(side=tk.LEFT, padx=(30, 0))
+                self.end_var = tk.StringVar(value="0")
+                ttk.Entry(time_frame, textvariable=self.end_var, width=10).pack(side=tk.LEFT, padx=10)
+
+                btn_frame = ttk.Frame(infer_frame)
+                btn_frame.pack(fill=tk.X, padx=10, pady=5)
+                ttk.Button(btn_frame, text="Add Files...", command=self.add_files).pack(side=tk.LEFT, padx=5)
+                self.btn_run = ttk.Button(btn_frame, text="Run Separation", command=self.toggle_run)
+                self.btn_run.pack(side=tk.LEFT, padx=5)
+                self.btn_pause = ttk.Button(btn_frame, text="Pause", command=self.toggle_pause, state=tk.DISABLED)
+                self.btn_pause.pack(side=tk.LEFT, padx=5)
+                ttk.Button(btn_frame, text="Clear Queue", command=self.clear_queue).pack(side=tk.LEFT, padx=5)
+
+                tree_frame = ttk.Frame(infer_frame)
+                tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+                self.tree = ttk.Treeview(tree_frame, columns=("File", "Progress", "Status"), show="headings")
+                self.tree.heading("File", text="File Path")
+                self.tree.heading("Progress", text="Progress")
+                self.tree.heading("Status", text="Status")
+                self.tree.column("File", width=550)
+                self.tree.column("Progress", width=250, anchor=tk.CENTER)
+                self.tree.column("Status", width=150, anchor=tk.CENTER)
+                self.tree.pack(fill=tk.BOTH, expand=True)
+
+                self.tree.bind('<Double-1>', self.on_queue_double_click)
+
+                if has_dnd:
+                    self.tree.drop_target_register(DND_FILES)
+                    self.tree.dnd_bind('<<Drop>>', self.handle_drop)
+
+                # =================  Player Tab =================
+                spec_frame = ttk.Frame(self.notebook)
+                self.notebook.add(spec_frame, text="Interactive Player")
+
+                paned = ttk.PanedWindow(spec_frame, orient=tk.HORIZONTAL)
+                paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+                left_panel = ttk.Frame(paned, style="TFrame")
+                paned.add(left_panel, weight=1)
+
+                self.lbl_converted = ttk.Label(left_panel, text="Converted Tracks", font=('Segoe UI', 12, 'bold'))
+                self.lbl_converted.pack(anchor=tk.W, pady=(0, 5))
+                self.track_listbox = tk.Listbox(left_panel, exportselection=False, bd=0, highlightthickness=1)
+                self.track_listbox.pack(fill=tk.BOTH, expand=True, pady=5)
+                self.track_listbox.bind('<Double-1>', self.on_track_select)
+
+                ttk.Button(left_panel, text="Scan Output Dir...",
+                           command=lambda: self.scan_folder(self.out_dir_var.get())).pack(fill=tk.X, pady=5)
+
+                right_panel = ttk.Frame(paned, style="TFrame")
+                paned.add(right_panel, weight=4)
+
+                top_controls = ttk.Frame(right_panel)
+                top_controls.pack(fill=tk.X, pady=(0, 5))
+
+                ttk.Label(top_controls, text="View (s) [Ctrl+Scroll zooms]:").pack(side=tk.LEFT)
+                self.window_var = tk.StringVar(value="15.0")
+                ttk.Entry(top_controls, textvariable=self.window_var, width=5).pack(side=tk.LEFT, padx=5)
+                self.window_var.trace_add("write", lambda *args: [self.update_scrollbar(), self.delayed_render()])
+
+                ttk.Label(top_controls, text="FFT:").pack(side=tk.LEFT, padx=(15, 0))
+                self.fft_var = tk.StringVar(value=str(n_fft))
+                ttk.Entry(top_controls, textvariable=self.fft_var, width=6).pack(side=tk.LEFT, padx=5)
+
+                player_controls = ttk.Frame(top_controls)
+                player_controls.pack(side=tk.RIGHT)
+
+                vol_frame = ttk.Frame(player_controls)
+                vol_frame.pack(side=tk.LEFT, padx=10)
+
+                self.vol_org_var = tk.DoubleVar(value=0.0)
+                self.vol_voc_var = tk.DoubleVar(value=1.0)
+                self.vol_inst_var = tk.DoubleVar(value=0.0)
+
+                ttk.Label(vol_frame, text="Original [1]:").pack(side=tk.LEFT)
+                ttk.Scale(vol_frame, from_=0, to=1.5, variable=self.vol_org_var, orient=tk.HORIZONTAL, length=60,
+                          command=self.update_volumes).pack(side=tk.LEFT, padx=(0, 5))
+                ttk.Label(vol_frame, text="Vocal [2]:").pack(side=tk.LEFT)
+                ttk.Scale(vol_frame, from_=0, to=1.5, variable=self.vol_voc_var, orient=tk.HORIZONTAL, length=60,
+                          command=self.update_volumes).pack(side=tk.LEFT, padx=(0, 5))
+                ttk.Label(vol_frame, text="Instrumental [3]:").pack(side=tk.LEFT)
+                ttk.Scale(vol_frame, from_=0, to=1.5, variable=self.vol_inst_var, orient=tk.HORIZONTAL, length=60,
+                          command=self.update_volumes).pack(side=tk.LEFT, padx=(0, 5))
+
+                self.btn_play = ttk.Button(player_controls, text="▶ Play (Space)", command=self.toggle_audio_playback)
+                self.btn_play.pack(side=tk.LEFT, padx=(10, 5))
+                self.time_label = ttk.Label(player_controls, text="Time: 0.0s", font=('Consolas', 10))
+                self.time_label.pack(side=tk.LEFT, padx=5)
+
+                self.file_status_frame = ttk.Frame(right_panel, style="TFrame")
+                self.file_status_frame.pack(fill=tk.X, padx=5, pady=(0, 5))
+
+                self.fs_lbls = {}
+                self.fs_btns = {}
+
+                for i, ttype in enumerate(['original', 'vocal', 'instr']):
+                    frame = ttk.Frame(self.file_status_frame, style="TFrame")
+                    frame.pack(side=tk.LEFT, padx=(0, 15))
+
+                    ttk.Label(frame, text=f"{ttype.capitalize()}:").pack(side=tk.LEFT)
+                    lbl = ttk.Label(frame, text="Missing")
+                    lbl.pack(side=tk.LEFT, padx=(5, 5))
+                    btn = ttk.Button(frame, text="Browse", command=lambda t=ttype: self.browse_missing(t))
+                    btn.pack(side=tk.LEFT)
+
+                    self.fs_lbls[ttype] = lbl
+                    self.fs_btns[ttype] = btn
+
+           
+                self.canvas_frame = ttk.Frame(right_panel, style="TFrame")
+                self.canvas_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+                self.scrollbar = ttk.Scrollbar(right_panel, orient=tk.HORIZONTAL, command=self.on_scroll)
+                self.scrollbar.pack(side=tk.BOTTOM, fill=tk.X, padx=0, pady=0)
+
+                self.canvas = tk.Canvas(self.canvas_frame, highlightthickness=0)
+                self.canvas.pack(fill=tk.BOTH, expand=True)
+
+                self.canvas.bind('<ButtonPress-1>', self.on_canvas_click)
+                self.canvas.bind('<ButtonPress-2>', self.on_canvas_pan_start)
+                self.canvas.bind('<ButtonPress-3>', self.on_canvas_pan_start)
+                self.canvas.bind('<B2-Motion>', self.on_canvas_pan_drag)
+                self.canvas.bind('<B3-Motion>', self.on_canvas_pan_drag)
+                self.canvas.bind('<MouseWheel>', self.on_canvas_scroll)
+                self.canvas.bind('<Configure>', lambda e: self.render_plot())
+
+                # ================= Simple STFT Center Remove Tab =================
+                stft_frame = ttk.Frame(self.notebook)
+                self.notebook.add(stft_frame, text="Simple STFT Center Remove")
+
+                stft_ctrl = ttk.LabelFrame(stft_frame, text=" Center removal (200–4000 Hz) ")
+                stft_ctrl.pack(fill=tk.X, padx=10, pady=10)
+
+                ttk.Label(stft_ctrl, text="Input WAV (stereo):").grid(row=0, column=0, padx=10, pady=10, sticky=tk.W)
+                self.stft_in_var = tk.StringVar()
+                ttk.Entry(stft_ctrl, textvariable=self.stft_in_var, width=70).grid(row=0, column=1, padx=10, pady=10)
+                ttk.Button(stft_ctrl, text="Browse...", command=self.browse_stft_input).grid(row=0, column=2, padx=10,
+                                                                                             pady=10)
+
+                ttk.Label(stft_ctrl, text="Output WAV:").grid(row=1, column=0, padx=10, pady=10, sticky=tk.W)
+                self.stft_out_var = tk.StringVar()
+                ttk.Entry(stft_ctrl, textvariable=self.stft_out_var, width=70).grid(row=1, column=1, padx=10, pady=10)
+                ttk.Button(stft_ctrl, text="Browse...", command=self.browse_stft_output).grid(row=1, column=2, padx=10,
+                                                                                              pady=10)
+
+                stft_btn_frame = ttk.Frame(stft_frame)
+                stft_btn_frame.pack(fill=tk.X, padx=10, pady=5)
+                self.stft_run_btn = ttk.Button(stft_btn_frame, text="Run Center Removal",
+                                               command=self.run_stft_separation)
+                self.stft_run_btn.pack(side=tk.LEFT, padx=5)
+
+                self.stft_status = ttk.Label(stft_btn_frame, text="Idle")
+                self.stft_status.pack(side=tk.LEFT, padx=20)
+
+
+            def on_queue_double_click(self, event):
+                selection = self.tree.selection()
+                if not selection: return
+                item = selection[0]
+                file_path = self.tree.item(item, "values")[0]
+
+                target_name = None
+                for name, data in self.tracks_data.items():
+                    if data.get('original') == file_path:
+                        target_name = name
+                        break
+
+                if not target_name:
+                    self.add_track_to_data(file_path, "", "", 0.0, 0.0)
+                    self.refresh_track_listbox()
+                    target_name = list(self.tracks_data.keys())[-1]
+
+                idx = list(self.tracks_data.keys()).index(target_name)
+                self.track_listbox.selection_clear(0, tk.END)
+                self.track_listbox.selection_set(idx)
+
+                self.notebook.select(1)
+                self.on_track_select(None)
+
+            def get_max_audio_duration(self):
+                max_len = max(len(self.audio_org), len(self.audio_voc), len(self.audio_inst))
+                return max_len / 44100.0 if max_len > 0 else 10.0
+
+            def update_volumes(self, *args):
+                self.vol_org = self.vol_org_var.get()
+                self.vol_voc = self.vol_voc_var.get()
+                self.vol_inst = self.vol_inst_var.get()
+
+            def browse_ckpt(self):
+                self.focus_set()
+                f = filedialog.askopenfilename(filetypes=[("Zip Checkpoint", "*.zip"), ("All Files", "*.*")])
+                if f: self.ckpt_var.set(f)
+
+            def browse_out_dir(self):
+                self.focus_set()
+                d = filedialog.askdirectory()
+                if d: self.out_dir_var.set(d)
+
+            def add_files(self):
+                self.focus_set()
+                files = filedialog.askopenfilenames(
+                    filetypes=[("Audio Files", "*.wav *.flac *.mp3"), ("All Files", "*.*")])
+                for f in files:
+                    self.tree.insert("", tk.END, values=(f, "[░░░░░░░░░░] 0%", "Pending"))
+
+            def clear_queue(self):
+                self.focus_set()
+                if not self.is_running:
+                    for item in self.tree.get_children():
+                        self.tree.delete(item)
+
+            def toggle_run(self):
+                self.focus_set()
+                if not self.is_running:
+                    self.is_running = True
+                    self.is_paused = False
+                    self.btn_run.config(text="Stop Processing")
+                    self.btn_pause.config(state=tk.NORMAL)
+
+                    ckpt = self.ckpt_var.get()
+                    out_dir = self.out_dir_var.get()
+                    try:
+                        s_sec = float(self.start_var.get())
+                        e_sec = float(self.end_var.get())
+                    except ValueError:
+                        s_sec, e_sec = 0.0, 0.0
+
+                    self.current_thread = threading.Thread(target=self.process_queue,
+                                                           args=(ckpt, out_dir, s_sec, e_sec), daemon=True)
+                    self.current_thread.start()
+                else:
+                    self.is_running = False
+                    self.is_paused = False
+                    self.btn_run.config(text="Run Separation")
+                    self.btn_pause.config(state=tk.DISABLED, text="Pause")
+
+            def toggle_pause(self):
+                self.focus_set()
+                self.is_paused = not self.is_paused
+                if self.is_paused:
+                    self.btn_pause.config(text="Resume")
+                else:
+                    self.btn_pause.config(text="Pause")
+
+            def update_file_status_ui(self):
+                if not self.current_track: return
+                colors = self.get_theme_colors()
+                for ttype in ['original', 'vocal', 'instr']:
+                    path = self.current_track.get(ttype)
+                    if path and os.path.exists(path):
+                        self.fs_lbls[ttype].config(text="Loaded", foreground=colors["ACCENT_CYAN"])
+                        self.fs_btns[ttype].config(text="Replace")
+                    else:
+                        self.fs_lbls[ttype].config(text="Missing", foreground=colors["ACCENT_PINK"])
+                        self.fs_btns[ttype].config(text="Browse")
+                
+                self.lbl_converted.config(foreground=colors["ACCENT_CYAN"])
+                self.time_label.config(foreground=colors["ACCENT_PINK"])
+                self.stft_status.config(foreground=colors["ACCENT_CYAN"])
+
+            def browse_missing(self, track_type):
+                self.focus_set()
+                if not self.current_track: return
+                f = filedialog.askopenfilename(filetypes=[("Audio Files", "*.wav *.flac *.mp3"), ("All Files", "*.*")])
+                if f:
+                    self.current_track[track_type] = f
+                    self.update_file_status_ui()
+                    self.load_track_into_memory()
+                    self.view_start = 0.0
+                    self.update_scrollbar()
+                    self.start_compute_thread()
+
+            def scan_folder(self, folder_path=None):
+                self.focus_set()
+                if folder_path is None:
+                    folder_path = filedialog.askdirectory(title="Select folder to scan")
+                if not folder_path or not os.path.exists(folder_path): return
+
+                found = 0
+                for f in os.listdir(folder_path):
+                    match = re.match(r"^(.*)_vocal_gui(?:_([0-9.]+)_([0-9.]+))?\.(wav|flac|mp3)$", f)
+                    if match:
+                        stem = match.group(1)
+                        s_start = float(match.group(2)) if match.group(2) else 0.0
+                        s_end = float(match.group(3)) if match.group(3) else 0.0
+                        ext = match.group(4)
+
+                        voc_path = os.path.join(folder_path, f)
+                        inst_name = f"{stem}_instr_gui_{s_start}_{s_end}.{ext}" if match.group(
+                            2) else f"{stem}_instr_gui.{ext}"
+                        inst_path = os.path.join(folder_path, inst_name)
+                        if not os.path.exists(inst_path): continue
+
+                        org_path = None
+                        for org_ext in ['.wav', '.flac', '.mp3']:
+                            temp = os.path.join(folder_path, stem + org_ext)
+                            if os.path.exists(temp):
+                                org_path = temp
+                                break
+
+                        self.add_track_to_data(org_path or f"(Missing Original) {stem}", voc_path, inst_path, s_start,
+                                               s_end)
+                        found += 1
+
+                if folder_path != os.getcwd() and found > 0 and folder_path != self.out_dir_var.get():
+                    messagebox.showinfo("Scan complete", f"Found {found} separated track(s)!")
+                self.refresh_track_listbox()
+
+            def add_track_to_data(self, org, voc, inst, start_sec, end_sec):
+                base_path = org if (org and os.path.exists(org)) else (voc if (voc and os.path.exists(voc)) else inst)
+                name = os.path.basename(base_path) if base_path else "Unknown"
+                if start_sec > 0 or end_sec > 0:
+                    name += f" [{start_sec}s - {end_sec}s]"
+
+                self.tracks_data[name] = {
+                    "original": org,
+                    "vocal": voc,
+                    "instr": inst,
+                    "frag_start": start_sec,
+                    "frag_end": end_sec
+                }
+
+            def refresh_track_listbox(self):
+                self.track_listbox.delete(0, tk.END)
+                for name in self.tracks_data.keys():
+                    self.track_listbox.insert(tk.END, name)
+
+            def handle_drop(self, event):
+                files = self.tk.splitlist(event.data)
+                for f in files:
+                    self.tree.insert("", tk.END, values=(f, "[░░░░░░░░░░] 0%", "Pending"))
+
+            def update_status(self, item_id, status):
+                try:
+                    self.tree.set(item_id, column="Status", value=status)
+                except tk.TclError:
+                    pass
+
+            def update_progress(self, item_id, pct, elapsed_sec=0, eta_sec=0):
+                try:
+                    bar_len = 10
+                    filled = int((pct / 100) * bar_len)
+                    bar = '█' * filled + '░' * (bar_len - filled)
+                    if pct >= 100:
+                        time_str = f" ({elapsed_sec}s)" if elapsed_sec > 0 else ""
+                    else:
+                        time_str = f" ({elapsed_sec}s | ETA: {eta_sec}s)" if elapsed_sec > 0 else ""
+                    self.tree.set(item_id, column="Progress", value=f"[{bar}] {pct}%{time_str}")
+                except tk.TclError:
+                    pass
+
+            def process_queue(self, checkpoint, out_dir, start_sec, end_sec):
+                if not os.path.exists(checkpoint):
+                    self.after(0, lambda: messagebox.showerror("Error", "Checkpoint not found!"))
+                    self.after(0, self.toggle_run)
+                    return
+
+                try:
+                    model.eval()
+                    load_checkpoint(checkpoint, model, optimizer)
+                except Exception as e:
+                    self.after(0, lambda: messagebox.showerror("Error", f"Failed to load checkpoint: {e}"))
+                    self.after(0, self.toggle_run)
+                    return
+
+                items = self.tree.get_children()
+                for item in items:
+                    if not self.is_running: break
+                    status = self.tree.item(item, "values")[2]
+
+                    if status == "Pending":
+                        input_path = self.tree.item(item, "values")[0]
+                        self.after(0, self.update_status, item, "Processing...")
+
+                        try:
+                            while self.is_paused and self.is_running: time.sleep(0.5)
+                            if not self.is_running: break
+
+                            proc_start_time = time.time()
+                            self.run_infer_logic(input_path, out_dir, start_sec, end_sec, item, proc_start_time)
+
+                            total_time = int(time.time() - proc_start_time)
+                            self.after(0, self.update_status, item, f"Done ({total_time}s)")
+                        except Exception as e:
+                            self.after(0, self.update_status, item, f"Error: {e}")
+
+                if self.is_running:
+                    self.after(0, self.toggle_run)
+                    self.after(0, lambda: messagebox.showinfo("Queue Finished", "All files processed."))
+
+            def quiet_add_new_track(self, org, voc, inst, start_sec, end_sec):
+                self.add_track_to_data(org, voc, inst, start_sec, end_sec)
+                self.refresh_track_listbox()
+
+            def run_infer_logic(self, input_path, out_dir, start_sec, end_sec, item_id, proc_start_time):
+                with torch.no_grad():
+                    duration = 4
+                    overlap = 2
+                    frames = int(duration * 44100)
+                    hop = int((duration - overlap) * 44100)
+
+                    sample_rate, total_frames = audio_info(input_path)
+                    if sample_rate != 44100: raise ValueError("Sample rate must be 44100Hz")
+
+                    start_frame = int(start_sec * 44100) if start_sec > 0 else 0
+                    end_frame = int(end_sec * 44100) if end_sec > 0 else total_frames
+                    if end_frame > total_frames or end_frame <= start_frame: end_frame = total_frames
+                    num_frames = end_frame - start_frame
+
+                    vocal_waveform = torch.zeros((2, num_frames), dtype=torch.float32)
+                    instr_waveform = torch.zeros((2, num_frames), dtype=torch.float32)
+                    weights = torch.zeros((1, num_frames), dtype=torch.float32)
+                    window = torch.hann_window(n_fft, periodic=True, dtype=torch.float32)
+                    full_samples = audio_read(input_path, start_frame, end_frame)
+
+                    for start in range(0, num_frames, hop):
+                        if not self.is_running: return
+                        while self.is_paused: time.sleep(0.5)
+
+                        end = start + frames
+                        samples = full_samples[:, start:end]
+                        if samples.shape[1] < frames:
+                            samples = nn.functional.pad(samples, (0, frames - samples.shape[1]))
+
+                        full = torch.stft(samples, n_fft=n_fft, return_complex=True, window=window)
+                        full_abs = full.abs()
+                        phase = full / torch.clamp(full_abs, min=1e-24)
+
+                        x = full_abs.unsqueeze(0).to(device)
+                        y = model(x)[0].cpu()
+
+                        vocal = phase * torch.clamp(y, min=0)
+                        instr = phase * torch.clamp(full_abs - y, min=0)
+
+                        vocal_reconstructed = torch.istft(vocal, n_fft=n_fft, window=window, center=True)
+                        instr_reconstructed = torch.istft(instr, n_fft=n_fft, window=window, center=True)
+
+                        size = min(vocal_reconstructed.shape[1], num_frames - start)
+
+                        vocal_waveform[:, start:start + size] += vocal_reconstructed[:, 0:size]
+                        instr_waveform[:, start:start + size] += instr_reconstructed[:, 0:size]
+                        weights[:, start:start + size] += 1
+
+                        pct_float = ((start + hop) / num_frames) * 100.0
+                        pct = min(100, int(pct_float))
+                        elapsed = time.time() - proc_start_time
+
+                        eta = int((elapsed / pct_float) * (100.0 - pct_float)) if pct_float > 0 else 0
+                        self.after(0, self.update_progress, item_id, pct, int(elapsed), eta)
+
+                    vocal_waveform /= weights
+                    instr_waveform /= weights
+
+                    self.after(0, self.update_progress, item_id, 100, int(time.time() - proc_start_time), 0)
+
+                    path_obj = Path(input_path)
+                    os.makedirs(out_dir, exist_ok=True)
+
+                    is_fragment = (start_sec > 0 or end_sec > 0)
+                    frag_suffix = f"_{start_sec}_{end_sec}" if is_fragment else ""
+
+                    out_voc = os.path.join(out_dir, path_obj.stem + f'_vocal_gui{frag_suffix}' + path_obj.suffix)
+                    out_inst = os.path.join(out_dir, path_obj.stem + f'_instr_gui{frag_suffix}' + path_obj.suffix)
+
+                    soundfile.write(out_voc, vocal_waveform.t().numpy(), 44100)
+                    soundfile.write(out_inst, instr_waveform.t().numpy(), 44100)
+                    
+                    out_org = os.path.join(out_dir, path_obj.name)
+                    if not os.path.exists(out_org) or not os.path.samefile(input_path, out_org):
+                        try:
+                            shutil.copy2(input_path, out_org)
+                        except Exception as e:
+                            print(f"Warning: could not copy original file to output dir: {e}")
+
+                    self.after(0, self.quiet_add_new_track, out_org, out_voc, out_inst, start_sec, end_sec)
+
+            # ================= PLAYER LOGIC  =================
+            def toggle_audio_playback(self):
+                self.focus_set()
+                if not has_sd: return
+                if self.is_playing:
+                    self.stop_audio()
+                else:
+                    self.play_audio()
+
+            def audio_callback(self, outdata, frames, time_info, status):
+                if not self.is_playing:
+                    outdata.fill(0)
+                    return
+                end_idx = self.play_idx + frames
+
+                org_c = self.audio_org[self.play_idx: end_idx]
+                voc_c = self.audio_voc[self.play_idx: end_idx]
+                inst_c = self.audio_inst[self.play_idx: end_idx]
+
+                actual_len = max(len(org_c), len(voc_c), len(inst_c))
+
+                if actual_len == 0:
+                    outdata.fill(0)
+                    raise sd.CallbackStop()
+
+                mix = np.zeros(actual_len, dtype=np.float32)
+                if len(org_c) == actual_len: mix += org_c * self.vol_org
+                if len(voc_c) == actual_len: mix += voc_c * self.vol_voc
+                if len(inst_c) == actual_len: mix += inst_c * self.vol_inst
+
+                outdata[:actual_len, 0] = mix
+                if actual_len < frames: outdata[actual_len:, 0] = 0
+
+                self.play_idx += actual_len
+                self.cursor_time = self.play_idx / 44100.0
+                if actual_len < frames: raise sd.CallbackStop()
+
+            def play_audio(self):
+                if not self.current_track or self.get_max_audio_duration() <= 0: return
+                self.stop_audio()
+                self.play_idx = int(self.cursor_time * 44100)
+                self.is_playing = True
+                self.btn_play.config(text="⏹ Stop (Space)")
+                try:
+                    self.stream = sd.OutputStream(samplerate=44100, channels=1, callback=self.audio_callback,
+                                                  blocksize=2048)
+                    self.stream.start()
+                except Exception as e:
+                    print("Play error:", e)
+                    self.stop_audio()
+
+            def stop_audio(self):
+                self.is_playing = False
+                if self.stream is not None:
+                    self.stream.stop()
+                    self.stream.close()
+                    self.stream = None
+                self.btn_play.config(text="▶ Play (Space)")
+
+            def update_playback_cursor(self):
+                if self.is_playing:
+                    try:
+                        window_len = float(self.window_var.get())
+                    except ValueError:
+                        window_len = 15.0
+
+                    if self.cursor_time > self.view_start + window_len * 0.95:
+                        self.view_start = self.cursor_time
+                        self.update_scrollbar()
+                        self.render_plot()
+                    elif self.cursor_time < self.view_start:
+                        self.view_start = max(0.0, self.cursor_time - window_len * 0.1)
+                        self.update_scrollbar()
+                        self.render_plot()
+
+                    self.update_cursor_position()
+                    self.time_label.config(text=f"Time: {self.cursor_time:.1f}s")
+                    if self.stream and not self.stream.active:
+                        self.stop_audio()
+
+                self.after(20, self.update_playback_cursor)
+
+            def on_canvas_click(self, event):
+                self.focus_set()
+                if not self.full_pil_images: return
+                w = self.canvas.winfo_width()
+                try:
+                    window_len = float(self.window_var.get())
+                except ValueError:
+                    window_len = 15.0
+
+                click_time = self.view_start + (event.x / w) * window_len
+                total_dur = self.get_max_audio_duration()
+
+                self.cursor_time = max(0.0, min(click_time, total_dur))
+                self.play_idx = int(self.cursor_time * 44100)
+                self.time_label.config(text=f"Time: {self.cursor_time:.1f}s")
+                self.update_cursor_position()
+
+                if self.is_playing: self.play_audio()
+
+            def on_canvas_pan_start(self, event):
+                self.focus_set()
+                self.drag_start_x = event.x
+                self.drag_start_view = self.view_start
+
+            def on_canvas_pan_drag(self, event):
+                if not hasattr(self, 'drag_start_x'): return
+                w = self.canvas.winfo_width()
+                try:
+                    window_len = float(self.window_var.get())
+                except ValueError:
+                    window_len = 15.0
+
+                dx_sec = ((event.x - self.drag_start_x) / w) * window_len
+                self.view_start = self.drag_start_view - dx_sec
+
+                total_dur = self.get_max_audio_duration()
+                if self.view_start > total_dur - window_len:
+                    self.view_start = max(0.0, total_dur - window_len)
+                if self.view_start < 0: self.view_start = 0.0
+
+                self.update_scrollbar()
+                self.render_plot()
+
+            def on_canvas_scroll(self, event):
+                self.focus_set()
+                if self.get_max_audio_duration() == 0: return
+                try:
+                    window_len = float(self.window_var.get())
+                except ValueError:
+                    window_len = 15.0
+
+                if (event.state & 0x0004):
+                    zoom_factor = 0.8 if event.delta > 0 else 1.25
+                    new_window = max(0.5, min(3600.0, window_len * zoom_factor))
+
+                    w = self.canvas.winfo_width()
+                    mouse_time = self.view_start + (event.x / w) * window_len
+                    self.view_start = mouse_time - (event.x / w) * new_window
+
+                    total_dur = self.get_max_audio_duration()
+                    if self.view_start > total_dur - new_window:
+                        self.view_start = max(0.0, total_dur - new_window)
+                    if self.view_start < 0: self.view_start = 0.0
+
+                    self.window_var.set(f"{new_window:.1f}")
+                else:
+                    shift = window_len * 0.1
+                    if event.delta > 0:
+                        self.view_start -= shift
+                    else:
+                        self.view_start += shift
+
+                    total_dur = self.get_max_audio_duration()
+                    if self.view_start > total_dur - window_len:
+                        self.view_start = max(0.0, total_dur - window_len)
+                    if self.view_start < 0: self.view_start = 0.0
+
+                    self.update_scrollbar()
+                    self.render_plot()
+
+            def on_scroll(self, *args):
+                if self.get_max_audio_duration() == 0: return
+                total_duration = self.get_max_audio_duration()
+                try:
+                    window_len = float(self.window_var.get())
+                except ValueError:
+                    window_len = 15.0
+
+                if args[0] == 'moveto':
+                    self.view_start = float(args[1]) * total_duration
+                elif args[0] == 'scroll':
+                    amount = int(args[1])
+                    if args[2] == 'pages':
+                        self.view_start += amount * window_len * 0.9
+                    else:
+                        self.view_start += amount * window_len * 0.1
+
+                if self.view_start > total_duration - window_len:
+                    self.view_start = max(0.0, total_duration - window_len)
+                if self.view_start < 0: self.view_start = 0.0
+
+                self.update_scrollbar()
+                self.render_plot()
+
+            def update_scrollbar(self):
+                total_duration = self.get_max_audio_duration()
+                if total_duration <= 0: return
+                try:
+                    window_len = float(self.window_var.get())
+                except ValueError:
+                    return
+
+                first = self.view_start / total_duration
+                last = (self.view_start + window_len) / total_duration
+
+                if last > 1.0: last = 1.0
+                if first < 0.0: first = 0.0
+                self.scrollbar.set(first, last)
+
+            # ================= Spectogram rendering =================
+            def load_track_into_memory(self):
+                t = self.current_track
+                sr = 44100
+
+                org = np.zeros(0, dtype=np.float32)
+                voc = np.zeros(0, dtype=np.float32)
+                inst = np.zeros(0, dtype=np.float32)
+
+                if t.get('original') and os.path.exists(t['original']):
+                    try:
+                        o, _ = soundfile.read(t['original'], always_2d=True)
+                        org = o[:, 0].astype(np.float32)
+                    except Exception as e:
+                        print("Err org:", e)
+
+                if t.get('vocal') and os.path.exists(t['vocal']):
+                    try:
+                        v, _ = soundfile.read(t['vocal'], always_2d=True)
+                        voc = v[:, 0].astype(np.float32)
+                    except Exception as e:
+                        print("Err voc:", e)
+
+                if t.get('instr') and os.path.exists(t['instr']):
+                    try:
+                        i, _ = soundfile.read(t['instr'], always_2d=True)
+                        inst = i[:, 0].astype(np.float32)
+                    except Exception as e:
+                        print("Err inst:", e)
+
+                start_idx = int(t.get('frag_start', 0.0) * sr)
+
+                max_len = max(len(org), start_idx + len(voc), start_idx + len(inst))
+
+                self.audio_org = np.zeros(max_len, dtype=np.float32)
+                self.audio_voc = np.zeros(max_len, dtype=np.float32)
+                self.audio_inst = np.zeros(max_len, dtype=np.float32)
+
+                if len(org) > 0: self.audio_org[:len(org)] = org
+                if len(voc) > 0: self.audio_voc[start_idx:start_idx + len(voc)] = voc
+                if len(inst) > 0: self.audio_inst[start_idx:start_idx + len(inst)] = inst
+
+            def start_compute_thread(self):
+                self.canvas.delete("all")
+                colors = self.get_theme_colors()
+                self.canvas.create_text(50, 50, text="Loading & computing full spectrograms... Please wait.",
+                                        fill=colors["ACCENT_CYAN"], font=("Segoe UI", 12, "bold"), anchor=tk.NW,
+                                        tags="loading_text")
+                self.loading_spec = True
+
+                try:
+                    n_fft_user = int(self.fft_var.get())
+                except ValueError:
+                    n_fft_user = 2048
+
+                threading.Thread(target=self.compute_spectrograms_thread, args=(n_fft_user,), daemon=True).start()
+
+            def on_track_select(self, event):
+                self.focus_set()
+                selection = self.track_listbox.curselection()
+                if not selection: return
+                self.stop_audio()
+
+                name = self.track_listbox.get(selection[0])
+                self.current_track = self.tracks_data[name]
+
+                self.update_file_status_ui()
+                self.load_track_into_memory()
+                self.view_start = 0.0
+
+                if self.current_track['frag_start'] > 0:
+                    self.view_start = self.current_track['frag_start']
+                    self.cursor_time = self.current_track['frag_start']
+                else:
+                    self.cursor_time = 0.0
+
+                self.update_scrollbar()
+                self.start_compute_thread()
+
+            def compute_spectrograms_thread(self, n_fft_user):
+                if self.get_max_audio_duration() == 0:
+                    self.loading_spec = False
+                    self.after(0, self.render_plot)
+                    return
+
+                sr = 44100
+                hop_len = 1024
+                if self.get_max_audio_duration() > 600:
+                    hop_len = 4096
+
+                n_mels = 128
+                new_pils = []
+                tracks = [self.audio_org, self.audio_voc, self.audio_inst]
+
+                for y in tracks:
+                    S = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=n_fft_user, hop_length=hop_len, n_mels=n_mels)
+                    S_dB = librosa.power_to_db(S, ref=1.0)
+
+                    S_dB = np.clip(S_dB, -80, 0)
+                    normalized = (S_dB + 80) / 80.0
+
+                    rgba = cm.magma(normalized)
+                    img_arr = (rgba * 255).astype(np.uint8)
+
+                    img = Image.fromarray(img_arr, 'RGBA')
+                    img = img.transpose(Image.FLIP_TOP_BOTTOM)
+                    new_pils.append(img)
+
+                self.full_pil_images = new_pils
+                self.loading_spec = False
+                self.after(0, self.render_plot)
+
+            def delayed_render(self):
+                if self.render_job is not None:
+                    self.after_cancel(self.render_job)
+                self.render_job = self.after(100, self.render_plot)
+
+            def render_plot(self):
+                self.canvas.delete("loading_text")
+                if self.loading_spec or not self.full_pil_images: return
+
+                w = self.canvas.winfo_width()
+                h = self.canvas.winfo_height()
+                if w < 10 or h < 10: return
+
+                try:
+                    window_len = float(self.window_var.get())
+                except ValueError:
+                    window_len = 15.0
+
+                if self.get_max_audio_duration() > 600:
+                    time_per_px = 4096 / 44100.0
+                else:
+                    time_per_px = 1024 / 44100.0
+
+                px_start = int(self.view_start / time_per_px)
+                px_end = int((self.view_start + window_len) / time_per_px)
+
+                max_px = self.full_pil_images[0].width
+                px_start = max(0, min(px_start, max_px - 1))
+                px_end = max(1, min(px_end, max_px))
+
+                actual_time_len = (px_end - px_start) * time_per_px
+                if actual_time_len <= 0: return
+
+                draw_w = int((actual_time_len / window_len) * w)
+                if draw_w < 1: draw_w = 1
+
+                sec_h = h // 3
+                self.tk_images = []
+                self.canvas.delete("spec_image")
+                self.canvas.delete("spec_label")
+
+                colors = self.get_theme_colors()
+
+                for i, img in enumerate(self.full_pil_images):
+                    crop = img.crop((px_start, 0, px_end, img.height))
+                    resized = crop.resize((draw_w, sec_h), Image.NEAREST)
+                    tk_img = ImageTk.PhotoImage(resized)
+                    self.tk_images.append(tk_img)
+
+                    y_offset = i * sec_h
+                    self.canvas.create_image(0, y_offset, anchor=tk.NW, image=tk_img, tags="spec_image")
+
+                    titles = ["Original", "Vocals", "Instrumental"]
+                    self.canvas.create_text(10, y_offset + 5, text=titles[i], fill=colors["ACCENT_CYAN"],
+                                            font=('Segoe UI', 10, 'bold'), anchor=tk.NW, tags="spec_label")
+
+                    if i > 0:
+                        self.canvas.create_line(0, y_offset, w, y_offset, fill=colors["ACCENT_PINK"], width=2, tags="spec_image")
+
+                self.canvas.tag_lower("spec_image")
+                self.update_cursor_position()
+
+            def update_cursor_position(self):
+                w = self.canvas.winfo_width()
+                h = self.canvas.winfo_height()
+                try:
+                    window_len = float(self.window_var.get())
+                except ValueError:
+                    window_len = 15.0
+
+                x = ((self.cursor_time - self.view_start) / window_len) * w
+
+                colors = self.get_theme_colors()
+
+                if not hasattr(self, 'cursor_line') or not self.canvas.find_withtag("cursor"):
+                    self.cursor_line = self.canvas.create_line(x, 0, x, h, fill=colors["CURSOR_COLOR"], width=2, tags="cursor")
+                else:
+                    self.canvas.coords(self.cursor_line, x, 0, x, h)
+                    self.canvas.itemconfig(self.cursor_line, fill=colors["CURSOR_COLOR"])
+                self.canvas.tag_raise("cursor")
+
+
+            def browse_stft_input(self):
+                self.focus_set()
+                f = filedialog.askopenfilename(filetypes=[("WAV files", "*.wav"), ("All Files", "*.*")])
+                if f:
+                    self.stft_in_var.set(f)
+                    # auto‑suggest output name
+                    base, ext = os.path.splitext(f)
+                    self.stft_out_var.set(base + "_center_removed.wav")
+
+            def browse_stft_output(self):
+                self.focus_set()
+                f = filedialog.asksaveasfilename(defaultextension=".wav", filetypes=[("WAV files", "*.wav")])
+                if f:
+                    self.stft_out_var.set(f)
+
+            def run_stft_separation(self):
+                if self.stft_sep_running:
+                    messagebox.showinfo("Busy", "A separation is already running.")
+                    return
+                in_path = self.stft_in_var.get().strip()
+                out_path = self.stft_out_var.get().strip()
+                if not in_path or not os.path.exists(in_path):
+                    messagebox.showerror("Error", "Select a valid input WAV file.")
+                    return
+                if not out_path:
+                    messagebox.showerror("Error", "Specify an output file path.")
+                    return
+
+                self.stft_sep_running = True
+                self.stft_run_btn.config(state=tk.DISABLED)
+                colors = self.get_theme_colors()
+                self.stft_status.config(text="Processing...", foreground=colors["ACCENT_PINK"])
+
+                def task():
+                    try:
+                        data, fs = soundfile.read(in_path, always_2d=True, dtype=np.float32)
+                        if data.shape[1] < 2:
+                            raise ValueError("Input must be a stereo file.")
+                        self._stft_center_remove(data, fs, out_path)
+                        self.after(0, lambda: self.stft_status.config(text="Done.", foreground=colors["ACCENT_CYAN"]))
+                    except Exception as e:
+                        self.after(0, lambda: self.stft_status.config(text=f"Error: {e}", foreground="#ff4444"))
+                    finally:
+                        self.after(0, lambda: self.stft_run_btn.config(state=tk.NORMAL))
+                        self.stft_sep_running = False
+
+                self.stft_sep_thread = threading.Thread(target=task, daemon=True)
+                self.stft_sep_thread.start()
+
+            def _stft_center_remove(self, data, fs, out_path):
+                """Exact implementation of the provided STFT center removal."""
+                FRAME_SIZE = 2048
+                HOP_SIZE = FRAME_SIZE // 2  # 50% overlap
+
+                if data.dtype != np.float32:
+                    data = data.astype(np.float32) / np.max(np.abs(data))
+                L = data[:, 0].copy()
+                R = data[:, 1].copy()
+                N = len(L)
+
+                window = np.hanning(FRAME_SIZE)
+
+                pad = FRAME_SIZE
+                L = np.pad(L, (0, pad), mode='constant')
+                R = np.pad(R, (0, pad), mode='constant')
+
+                L_out = np.zeros_like(L)
+                R_out = np.zeros_like(R)
+
+                freqs = np.fft.rfftfreq(FRAME_SIZE, d=1 / fs)
+                low_mask = freqs <= 200
+                mid_mask = (freqs > 200) & (freqs <= 4000)
+                high_mask = freqs > 4000
+
+                total_frames = (len(L) - FRAME_SIZE) // HOP_SIZE + 1
+                frame_count = 0
+
+                colors = self.get_theme_colors()
+
+                for i in range(0, len(L) - FRAME_SIZE + 1, HOP_SIZE):
+                    frame_L = L[i:i + FRAME_SIZE] * window
+                    frame_R = R[i:i + FRAME_SIZE] * window
+
+                    L_fft = np.fft.rfft(frame_L)
+                    R_fft = np.fft.rfft(frame_R)
+
+                    L_low = L_fft * low_mask
+                    L_mid = L_fft * mid_mask
+                    L_high = L_fft * high_mask
+                    R_low = R_fft * low_mask
+                    R_mid = R_fft * mid_mask
+                    R_high = R_fft * high_mask
+
+                    mid_side = L_mid - R_mid
+                    L_mid_new = mid_side
+                    R_mid_new = -mid_side
+
+                    L_fft_out = L_low + L_mid_new + L_high
+                    R_fft_out = R_low + R_mid_new + R_high
+
+                    frame_L_out = np.fft.irfft(L_fft_out)
+                    frame_R_out = np.fft.irfft(R_fft_out)
+
+                    L_out[i:i + FRAME_SIZE] += frame_L_out * window
+                    R_out[i:i + FRAME_SIZE] += frame_R_out * window
+
+                    frame_count += 1
+                    # Update progress every 100 frames
+                    if frame_count % 100 == 0:
+                        pct = int((i / len(L)) * 100)
+                        self.after(0, self.stft_status.config,
+                                   f"Processing... {pct}%", colors["ACCENT_PINK"])
+
+                # Remove padding
+                L_out = L_out[:N]
+                R_out = R_out[:N]
+
+                # Normalize
+                max_val = max(np.max(np.abs(L_out)), np.max(np.abs(R_out)))
+                if max_val > 0:
+                    L_out /= max_val
+                    R_out /= max_val
+
+                out = np.stack((L_out, R_out), axis=1)
+
+                # Write 16-bit WAV (as original)
+                soundfile.write(out_path, (out * 32767).astype(np.int16), fs, subtype='PCM_16')
+
+
+        app = AudioSeparationGUI()
+        app.mainloop()
+
     case [_, 'prepare']:
         duration = 4
         overlap  = 2
@@ -970,16 +2220,13 @@ match sys.argv:
             if current_track != track:
                 current_track = track
                 break
-            
-            waveform[:, start:start+fragment.shape[1]] += fragment[:]
-            weights[:, start:start+fragment.shape[1]] += 1
 
-                         
-        
+            waveform[:, start:start + fragment.shape[1]] += fragment[:]
+            weights[:, start:start + fragment.shape[1]] += 1
+
         waveform /= weights
-        
-        torchaudio.save('load_test.wav', waveform, 44100)
-        
+        soundfile.write('load_test.wav', waveform.t().numpy(), 44100)
+
     case [_, 'train']:
         def train():
             model.train()
@@ -1145,6 +2392,7 @@ match sys.argv:
     case _:
         print(f'unknown command')
         print(f'usage:')
+        print(f'  gui       | Runs the graphical user interface for inference and spectrogram viewing')
         print(f'  info      | Prints information about current model')
         print(f'  prepare   | Prepares the train and test dataset indexes from ./musdb/train and ./musdb/test directories')
         print(f'  load_test | Reconstructs first track as specified in train dataset index to load_test.wav' )
